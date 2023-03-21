@@ -92,6 +92,16 @@ final class RedisClient implements RedisInterface
     private ?\Redis $phpredis = null;
 
     /**
+     * @var int number of hits
+     */
+    private $hits = 0;
+
+    /**
+     * @var int number of misses
+     */
+    private $misses = 0;
+
+    /**
      * Static Redisw factory method
      *
      * @param array $config [host, port, connect_timeout, connect_tries, persistent, db_index, cache_ttl, auth_password, ssl, key_prefix]
@@ -254,6 +264,52 @@ final class RedisClient implements RedisInterface
         $this->phpredis = null;
 
         throw new RedisTriesOverConnectException("Redis Connection failed after $count tries");
+    }
+
+    /**
+     * Encodes a value to be stored inside a Redis key.
+     * This is to avoid issues with serialization of null, false and true, and to avoid errors while getting the value back from Redis.
+     * In fact, literal FALSE is considered as an exception.
+     *
+     * @param mixed $value
+     *
+     * @return mixed
+     */
+    private function encode($value)
+    {
+        if (is_null($value)) {
+            return '##REDIS__NULL__VAR##';
+        }
+        if ($value === false) {
+            return '##REDIS__FALSE__VAR##';
+        }
+        if ($value === true) {
+            return '##REDIS__TRUE__VAR##';
+        }
+
+        return $value;
+    }
+
+    /**
+     * Decodes a value stored inside a Redis key.
+     *
+     * @param mixed $value
+     *
+     * @return mixed
+     */
+    private function decode($value)
+    {
+        if ($value === '##REDIS__NULL__VAR##') {
+            return null;
+        }
+        if ($value === '##REDIS__FALSE__VAR##') {
+            return false;
+        }
+        if ($value === '##REDIS__TRUE__VAR##') {
+            return true;
+        }
+
+        return $value;
     }
 
     /**
@@ -596,6 +652,87 @@ final class RedisClient implements RedisInterface
         return $this->keyPrefix;
     }
 
+    /**
+     * Getter of cache hits (keys found when checking for has() or exists())
+     *
+     * @return int
+     */
+    public function getHits() : int
+    {
+        return $this->hits;
+    }
+
+    /**
+     * Getter of cache misses (keys not found when checking for has() or exists())
+     *
+     * @return int
+     */
+    public function getMisses() : int
+    {
+        return $this->misses;
+    }
+
+    /*
+     * custom redis methods
+     */
+
+    /**
+     * Get all keys and relative values
+     *
+     * @return array
+     */
+    public function allValues()
+    {
+        $keys = $this->connection()->keys('*');
+        $result = array_map(function ($key) {
+            return $this->connection()->get($key);
+        }, $keys);
+        
+        return array_combine($keys, $result);
+    }
+
+    /**
+     * Get all keys
+     *
+     * @return array
+     */
+    public function allKeys()
+    {
+        return $this->connection()->keys('*');
+    }
+
+    /**
+     * Flush all Redis keys asynchronously
+     *
+     * @return void
+     */
+    public function flushAll()
+    {
+        return $this->phpredis->rawCommand('FLUSHALL', 'ASYNC');
+    }
+
+    /**
+     * Disconnect from Redis
+     *
+     * @return void
+     */
+    public function disconnect()
+    {
+        $this->phpredis->close();
+    }
+
+    /**
+     * Check if a key exists
+     *
+     * @param string $key key
+     *
+     * @return bool
+     */
+    public function has(string $key) : bool
+    {
+        return $this->exists($key);
+    }
+
     /*
      * phpredis interface implementation
      */
@@ -886,10 +1023,17 @@ final class RedisClient implements RedisInterface
      *
      * @throws RedisConnectionException exception on connection to redis instance
      */
-    public function exists(string $key)
+    public function exists(string $key) : bool
     {
         try {
-            return $this->connection()->exists($key);
+            $exists = $this->connection()->exists($key);
+            if ($exists) {
+                $this->hits++;
+            } else {
+                $this->misses++;
+            }
+
+            return $exists;
         } catch (\RedisException $ex) {
             throw new RedisConnectionException();
         }
@@ -1289,96 +1433,5 @@ final class RedisClient implements RedisInterface
         } catch (\RedisException $ex) {
             throw new RedisConnectionException();
         }
-    }
-
-    /**
-     * Encodes a value to be stored inside a Redis key.
-     * This is to avoid issues with serialization of null, false and true, and to avoid errors while getting the value back from Redis.
-     * In fact, literal FALSE is considered as an exception.
-     *
-     * @param mixed $value
-     *
-     * @return mixed
-     */
-    private function encode($value)
-    {
-        if (is_null($value)) {
-            return '##REDIS__NULL__VAR##';
-        }
-        if ($value === false) {
-            return '##REDIS__FALSE__VAR##';
-        }
-        if ($value === true) {
-            return '##REDIS__TRUE__VAR##';
-        }
-
-        return $value;
-    }
-
-    /**
-     * Decodes a value stored inside a Redis key.
-     *
-     * @param mixed $value
-     *
-     * @return mixed
-     */
-    private function decode($value)
-    {
-        if ($value === '##REDIS__NULL__VAR##') {
-            return null;
-        }
-        if ($value === '##REDIS__FALSE__VAR##') {
-            return false;
-        }
-        if ($value === '##REDIS__TRUE__VAR##') {
-            return true;
-        }
-
-        return $value;
-    }
-
-    /**
-     * Get all keys and relative values
-     *
-     * @return array
-     */
-    public function allValues()
-    {
-        $keys = $this->connection()->keys('*');
-        $result = array_map(function ($key) {
-            return $this->connection()->get($key);
-        }, $keys);
-        
-        return array_combine($keys, $result);
-    }
-
-    /**
-     * Get all keys
-     *
-     * @return array
-     */
-    public function allKeys()
-    {
-        return $this->connection()->keys('*');
-    }
-
-    /**
-     * Flush all Redis keys asynchronously
-     *
-     * @return void
-     */
-    public function flushAll()
-    {
-        return $this->phpredis->rawCommand('FLUSHALL', 'ASYNC');
-    }
-
-    /**
-     * Disconnect from Redis
-     *
-     * @return void
-     */
-    public function disconnect()
-    {
-        $this->phpredis->close();
     }
 }
