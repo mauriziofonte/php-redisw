@@ -45,6 +45,9 @@ try {
     // get a key
     $value = $client->get('somekey');
 }
+catch(\Exception $ex) {
+    echo "Something got wrong: {$ex->getMessage()}";
+}
 
 ```
 
