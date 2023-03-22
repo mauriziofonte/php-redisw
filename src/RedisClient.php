@@ -683,12 +683,16 @@ final class RedisClient implements RedisInterface
      */
     public function allValues()
     {
-        $keys = $this->connection()->keys('*');
-        $result = array_map(function ($key) {
-            return $this->connection()->get($key);
-        }, $keys);
-        
-        return array_combine($keys, $result);
+        try {
+            $keys = $this->connection()->keys('*');
+            $result = array_map(function ($key) {
+                return $this->connection()->get($key);
+            }, $keys);
+                    
+            return array_combine($keys, $result);
+        } catch (\Exception $e) {
+            throw new RedisConnectionException();
+        }
     }
 
     /**
@@ -698,7 +702,11 @@ final class RedisClient implements RedisInterface
      */
     public function allKeys()
     {
-        return $this->connection()->keys('*');
+        try {
+            return $this->connection()->keys('*');
+        } catch (\Exception $e) {
+            throw new RedisConnectionException();
+        }
     }
 
     /**
@@ -708,7 +716,11 @@ final class RedisClient implements RedisInterface
      */
     public function flushAll()
     {
-        return $this->phpredis->rawCommand('FLUSHALL', 'ASYNC');
+        try {
+            $this->connection()->rawCommand('FLUSHALL', 'ASYNC');
+        } catch (\Exception $e) {
+            throw new RedisConnectionException();
+        }
     }
 
     /**
@@ -718,7 +730,11 @@ final class RedisClient implements RedisInterface
      */
     public function disconnect()
     {
-        $this->phpredis->close();
+        try {
+            $this->connection()->close();
+        } catch (\Exception $e) {
+            // no-op. Do not throw exception on disconnect
+        }
     }
 
     /**
