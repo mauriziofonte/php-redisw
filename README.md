@@ -36,7 +36,9 @@ try {
         'cache_ttl' => 60, // optional. Defaults to 60 sec.
         'auth_password' => '', // optional
         'ssl' => '', // optional
-        'key_prefix' => 'some_prefix' // optional
+        'key_prefix' => 'some_prefix', // optional
+        'serializer' => 'ibginary', // optional. One of: igbinary, json, php
+        'compression' => 'lzf', // optional. One of: lzf, zstd, lz4
     ]);
 
     // set a key
@@ -48,6 +50,11 @@ try {
 catch(\Exception $ex) {
     echo "Something got wrong: {$ex->getMessage()}";
 }
+
+// don't want exceptions while setting/getting/whatever?
+$client->wrap('set', 'wont-throw-exceptions', [1, 2, 3, 4]);
+
+$value = $client->wrap('get', 'wont-throw-exceptions');
 
 ```
 

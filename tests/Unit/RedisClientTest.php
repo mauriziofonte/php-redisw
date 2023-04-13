@@ -93,4 +93,29 @@ class RedisClientTest extends TestCase
         // assert that getAllKeys returns the same keys
         $this->assertEquals($arr, $this->baseClient->allValues());
     }
+
+    public function testWillThrowException()
+    {
+        try {
+            $whatever = $this->baseClient->get('key_that_does_not_exist');
+        } catch(\Exception $e) {
+            $this->assertTrue(true);
+            return;
+        }
+
+        $this->fail('Exception not thrown');
+    }
+
+    public function testWontThrowException()
+    {
+        // get a key that does not exist
+        try {
+            $whatever = $this->baseClient->wrap('get', 'key_that_does_not_exist');
+            $whatever2 = $this->baseClient->wrap('mget', ['key_that_does_not_exist', 'key_that_does_not_exist_either']);
+        } catch(\Exception $e) {
+            $this->fail('Exception thrown');
+        }
+
+        $this->assertTrue(true);
+    }
 }

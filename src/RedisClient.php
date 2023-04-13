@@ -231,20 +231,18 @@ final class RedisClient implements RedisInterface
                 }
 
                 // check if we have a Serializer
-                if (! empty($this->serializer)) {
-                    switch($this->serializer) {
-                        case 'igbinary':
-                            $serializer = \Redis::SERIALIZER_IGBINARY;
-                            break;
-                        case 'json':
-                            $serializer = \Redis::SERIALIZER_JSON;
-                            break;
-                        case 'php':
-                            $serializer = \Redis::SERIALIZER_PHP;
-                            break;
-                        default:
-                            $serializer = \Redis::SERIALIZER_NONE;
-                    }
+                switch($this->serializer) {
+                    case 'igbinary':
+                        $serializer = \Redis::SERIALIZER_IGBINARY;
+                        break;
+                    case 'json':
+                        $serializer = \Redis::SERIALIZER_JSON;
+                        break;
+                    case 'php':
+                        $serializer = \Redis::SERIALIZER_PHP;
+                        break;
+                    default:
+                        $serializer = \Redis::SERIALIZER_NONE;
                 }
                 $this->phpredis->setOption(\Redis::OPT_SERIALIZER, $serializer);
 
@@ -742,7 +740,7 @@ final class RedisClient implements RedisInterface
         try {
             $keys = $this->connection()->keys('*');
             $result = array_map(function ($key) {
-                return $this->connection()->get($key);
+                return $this->get($key);
             }, $keys);
                     
             return array_combine($keys, $result);

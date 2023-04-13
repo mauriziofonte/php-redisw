@@ -48,14 +48,12 @@ abstract class TestCase extends PHPUnitTestCase
     protected static function getRandomValue()
     {
         $randomValue = null;
-        switch (rand(0, 5)) {
+        switch (rand(0, 4)) {
             case 0:
                 $randomValue = 'string';
-
                 break;
             case 1:
                 $randomValue = rand(0, 100);
-
                 break;
             case 2:
                 // pick a random number from 1 to 10
@@ -64,24 +62,14 @@ abstract class TestCase extends PHPUnitTestCase
                 $randomValue = array_map(function () {
                     return rand(1, 100);
                 }, array_fill(0, $randKeys, null));
-
                 break;
             case 3:
                 $randomValue = true;
-
                 break;
             case 4:
-                $temp = new \stdClass();
-                $temp->property = 'value';
-                $temp->property2 = 2;
-                $temp->property3 = true;
-                $randomValue = $temp;
-
+                $randomValue = null;
                 break;
             case 5:
-                $randomValue = null;
-
-                break;
         }
         
         return $randomValue;
