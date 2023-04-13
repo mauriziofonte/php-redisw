@@ -69,7 +69,7 @@ final class RedisClient implements RedisInterface
     /**
      * @var string redis instance auth password
      */
-    private string $authPassword = '';
+    private string $auth = '';
 
     /**
      * @var bool use ssl connection, or not
@@ -85,6 +85,11 @@ final class RedisClient implements RedisInterface
      * @var string|null compression method
      */
     private ?string $compression = null;
+
+    /**
+     * @var string|null serializer method
+     */
+    private ?string $serializer = null;
 
     /**
      * @var Redis phpredis object instance
@@ -133,14 +138,20 @@ final class RedisClient implements RedisInterface
         } else {
             $client->setCacheTTL(self::$defaultRedisCacheTtlSeconds);
         }
-        if (array_key_exists('auth_password', $config)) {
-            $client->setAuthPassword($config['auth_password']);
+        if (array_key_exists('auth', $config)) {
+            $client->setAuthPassword($config['auth']);
         }
         if (array_key_exists('ssl', $config)) {
             $client->setSsl($config['ssl']);
         }
         if (array_key_exists('key_prefix', $config)) {
             $client->setKeyPrefix($config['key_prefix']);
+        }
+        if (array_key_exists('compression', $config)) {
+            $client->setCompression($config['compression']);
+        }
+        if (array_key_exists('serializer', $config)) {
+            $client->setCompression($config['serializer']);
         }
 
         return $client;
@@ -186,9 +197,10 @@ final class RedisClient implements RedisInterface
      */
     private function reconnect() : bool
     {
-        $count = 0;
+        $tries = 0;
         do {
-            $count += 1;
+            // increment tries counter
+            $tries ++;
 
             try {
                 // create new phpredis object
@@ -204,8 +216,8 @@ final class RedisClient implements RedisInterface
                 }
 
                 // check if we have to authenticate
-                if (! empty($this->authPassword)) {
-                    $this->phpredis->auth($this->authPassword);
+                if (! empty($this->auth)) {
+                    $this->phpredis->auth($this->auth);
                 }
 
                 // check if we have a DB index to select
@@ -218,35 +230,39 @@ final class RedisClient implements RedisInterface
                     $this->phpredis->setOption(\Redis::OPT_PREFIX, $this->keyPrefix);
                 }
 
-                // if we have the IGBINARY serializer, set it. Otherwise, fallback to JSON, then to native PHP
-                if (defined('\Redis::SERIALIZER_IGBINARY')) {
-                    $this->phpredis->setOption(\Redis::OPT_SERIALIZER, \Redis::SERIALIZER_IGBINARY);
-                } elseif (defined('\Redis::SERIALIZER_JSON')) {
-                    $this->phpredis->setOption(\Redis::OPT_SERIALIZER, \Redis::SERIALIZER_JSON);
-                } else {
-                    $this->phpredis->setOption(\Redis::OPT_SERIALIZER, \Redis::SERIALIZER_PHP);
-                }
-
-                // check if we have to compress
-                if ($this->compression !== null) {
-                    switch($this->compression) {
-                        case 'lzf':
-                            $compression = \Redis::COMPRESSION_LZF;
-
+                // check if we have a Serializer
+                if (! empty($this->serializer)) {
+                    switch($this->serializer) {
+                        case 'igbinary':
+                            $serializer = \Redis::SERIALIZER_IGBINARY;
                             break;
-                        case 'zstd':
-                            $compression = \Redis::COMPRESSION_ZSTD;
-
+                        case 'json':
+                            $serializer = \Redis::SERIALIZER_JSON;
                             break;
-                        case 'lz4':
-                            $compression = \Redis::COMPRESSION_LZ4;
-
+                        case 'php':
+                            $serializer = \Redis::SERIALIZER_PHP;
                             break;
                         default:
-                            $compression = \Redis::COMPRESSION_NONE;
+                            $serializer = \Redis::SERIALIZER_NONE;
                     }
-                    $this->phpredis->setOption(\Redis::OPT_COMPRESSION, $compression);
                 }
+                $this->phpredis->setOption(\Redis::OPT_SERIALIZER, $serializer);
+
+                // set compression mode
+                switch($this->compression) {
+                    case 'lzf':
+                        $compression = \Redis::COMPRESSION_LZF;
+                        break;
+                    case 'zstd':
+                        $compression = \Redis::COMPRESSION_ZSTD;
+                        break;
+                    case 'lz4':
+                        $compression = \Redis::COMPRESSION_LZ4;
+                        break;
+                    default:
+                        $compression = \Redis::COMPRESSION_NONE;
+                }
+                $this->phpredis->setOption(\Redis::OPT_COMPRESSION, $compression);
 
                 // test ping to check if connection is ok
                 if ($this->phpredis->ping('pong') === 'pong') {
@@ -259,11 +275,11 @@ final class RedisClient implements RedisInterface
             } catch (\RedisException $ex) {
                 throw new RedisConnectionException("Redis Connection failed: " . $ex->getMessage(), $ex->getCode(), $ex);
             }
-        } while ($count < $this->connectTries);
+        } while ($tries <= $this->connectTries);
 
         $this->phpredis = null;
 
-        throw new RedisTriesOverConnectException("Redis Connection failed after $count tries");
+        throw new RedisTriesOverConnectException("Redis Connection failed after {$tries} tries");
     }
 
     /**
@@ -467,31 +483,31 @@ final class RedisClient implements RedisInterface
     }
 
     /**
-     * Setter of redis instance auth password
+     * Setter of redis instance Authentication
      *
-     * @param string $authPassword redis instance auth password
+     * @param string $auth redis instance authentication
      *
      * @return RedisClient self
      */
-    public function setAuthPassword($authPassword) : RedisClient
+    public function setAuthPassword($auth) : RedisClient
     {
-        if (! is_string($authPassword) || empty($authPassword)) {
-            throw new \InvalidArgumentException("Invalid auth password. Auth password must be a non empty string.");
+        if (! is_string($auth) || empty($auth)) {
+            throw new \InvalidArgumentException("Invalid authentication. Auth password must be a non empty string.");
         }
         
-        $this->authPassword = $authPassword;
+        $this->auth = $auth;
 
         return $this;
     }
 
     /**
-     * Getter of redis instance auth password
+     * Getter of redis instance Authentication
      *
-     * @return string redis instance auth password
+     * @return string|null redis instance Authentication
      */
-    public function getAuthPassword() : ?string
+    public function getAuth() : ?string
     {
-        return $this->authPassword;
+        return $this->auth;
     }
 
     /**
@@ -617,9 +633,9 @@ final class RedisClient implements RedisInterface
      * Getter of Redis Compression.
      * Valid compression values are: lzf, zstd, lz4
      *
-     * @return string compression
+     * @return string|null compression
      */
-    public function getCompression() : string
+    public function getCompression() : ?string
     {
         return $this->compression;
     }
@@ -645,11 +661,51 @@ final class RedisClient implements RedisInterface
     /**
      * Getter of key prefix
      *
-     * @return string key prefix
+     * @return string|null key prefix
      */
-    public function getKeyPrefix() : string
+    public function getKeyPrefix() : ?string
     {
         return $this->keyPrefix;
+    }
+
+    /**
+     * Setter of serializer
+     *
+     * @param string $serializer serializer
+     *
+     * @return RedisClient self
+     */
+    public function setSerializer(string $serializer) : RedisClient
+    {
+        if (! in_array($serializer, ['json', 'igbinary', 'php'])) {
+            throw new \InvalidArgumentException("Invalid serializer value. Valid values are: json, igbinary, php");
+        }
+
+        if ($serializer === 'igbinary' && ! defined('\Redis::SERIALIZER_IGBINARY')) {
+            throw new \InvalidArgumentException("Igbinary serializer is not supported by your version of phpredis.");
+        }
+
+        if ($serializer === 'json' && ! defined('\Redis::SERIALIZER_JSON')) {
+            throw new \InvalidArgumentException("JSON serializer is not supported by your version of phpredis.");
+        }
+
+        if ($serializer === 'php' && ! defined('\Redis::SERIALIZER_PHP')) {
+            throw new \InvalidArgumentException("PHP serializer is not supported by your version of phpredis.");
+        }
+
+        $this->serializer = $serializer;
+
+        return $this;
+    }
+
+    /**
+     * Getter of serializer
+     *
+     * @return string serializer
+     */
+    public function getSerializer() : ?string
+    {
+        return $this->serializer;
     }
 
     /**
@@ -747,6 +803,33 @@ final class RedisClient implements RedisInterface
     public function has(string $key) : bool
     {
         return $this->exists($key);
+    }
+
+    /**
+     * Wrap a call to a specific Redis command, by passing the command name and the arguments.
+     * This method will return the result of the command, or null if the command fails, silently catching any exception.
+     * This method will throw an InvalidArgumentException if the command does not exist.
+     *
+     * @param string $command command name
+     * @param mixed $args command arguments
+     *
+     * @return mixed
+     */
+    public function wrap()
+    {
+        $args = func_get_args();
+        $command = array_shift($args);
+
+        try {
+            // check that the method exists
+            if (! method_exists($this, $command)) {
+                throw new \InvalidArgumentException("Method {$command} does not exist.");
+            }
+
+            return call_user_func_array([$this, $command], $args);
+        } catch (\Exception $e) {
+            return null;
+        }
     }
 
     /*
