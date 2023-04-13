@@ -151,7 +151,7 @@ final class RedisClient implements RedisInterface
             $client->setCompression($config['compression']);
         }
         if (array_key_exists('serializer', $config)) {
-            $client->setCompression($config['serializer']);
+            $client->setSerializer($config['serializer']);
         }
 
         return $client;
