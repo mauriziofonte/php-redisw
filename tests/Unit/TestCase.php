@@ -16,6 +16,8 @@ abstract class TestCase extends PHPUnitTestCase
             'host' => '127.0.0.1',
             'port' => 6379,
             'connect_timeout' => 1,
+            'compression' => 'none',
+            'serializer' => 'php',
         ]);
     }
 
@@ -51,9 +53,11 @@ abstract class TestCase extends PHPUnitTestCase
         switch (rand(0, 4)) {
             case 0:
                 $randomValue = 'string';
+
                 break;
             case 1:
                 $randomValue = rand(0, 100);
+
                 break;
             case 2:
                 // pick a random number from 1 to 10
@@ -62,14 +66,16 @@ abstract class TestCase extends PHPUnitTestCase
                 $randomValue = array_map(function () {
                     return rand(1, 100);
                 }, array_fill(0, $randKeys, null));
+
                 break;
             case 3:
                 $randomValue = true;
+
                 break;
             case 4:
                 $randomValue = null;
+
                 break;
-            case 5:
         }
         
         return $randomValue;

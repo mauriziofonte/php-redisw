@@ -3,6 +3,7 @@
 namespace Mfonte\Redisw;
 
 use Mfonte\Redisw\Exception\RedisConnectionException;
+use Mfonte\Redisw\Exception\RedisException as BaseRedisException;
 use Mfonte\Redisw\Exception\RedisImpossibleValueException;
 use Mfonte\Redisw\Exception\RedisKeyNotFoundException;
 use Mfonte\Redisw\Exception\RedisNotConfiguredException;
@@ -200,7 +201,7 @@ final class RedisClient implements RedisInterface
         $tries = 0;
         do {
             // increment tries counter
-            $tries ++;
+            $tries++;
 
             try {
                 // create new phpredis object
@@ -234,12 +235,15 @@ final class RedisClient implements RedisInterface
                 switch($this->serializer) {
                     case 'igbinary':
                         $serializer = \Redis::SERIALIZER_IGBINARY;
+
                         break;
                     case 'json':
                         $serializer = \Redis::SERIALIZER_JSON;
+
                         break;
                     case 'php':
                         $serializer = \Redis::SERIALIZER_PHP;
+
                         break;
                     default:
                         $serializer = \Redis::SERIALIZER_NONE;
@@ -250,12 +254,15 @@ final class RedisClient implements RedisInterface
                 switch($this->compression) {
                     case 'lzf':
                         $compression = \Redis::COMPRESSION_LZF;
+
                         break;
                     case 'zstd':
                         $compression = \Redis::COMPRESSION_ZSTD;
+
                         break;
                     case 'lz4':
                         $compression = \Redis::COMPRESSION_LZ4;
+
                         break;
                     default:
                         $compression = \Redis::COMPRESSION_NONE;
@@ -271,7 +278,7 @@ final class RedisClient implements RedisInterface
                     throw new RedisConnectionException("Redis Ping test failed");
                 }
             } catch (\RedisException $ex) {
-                throw new RedisConnectionException("Redis Connection failed: " . $ex->getMessage(), $ex->getCode(), $ex);
+                throw new BaseRedisException("Redis Connection failed: " . $ex->getMessage(), $ex->getCode(), $ex);
             }
         } while ($tries <= $this->connectTries);
 
@@ -606,8 +613,8 @@ final class RedisClient implements RedisInterface
      */
     public function setCompression($compression) : RedisClient
     {
-        if (! is_string($compression) || ! in_array($compression, ['lzf', 'zstd', 'lz4'])) {
-            throw new \InvalidArgumentException("Invalid compression value. Valid values are: lzf, zstd, lz4");
+        if (! is_string($compression) || ! in_array($compression, ['lzf', 'zstd', 'lz4', 'none'])) {
+            throw new \InvalidArgumentException("Invalid compression value. Valid values are: lzf, zstd, lz4, none");
         }
 
         if ($compression === 'lzf' && ! defined('\Redis::COMPRESSION_LZF')) {
@@ -620,6 +627,10 @@ final class RedisClient implements RedisInterface
 
         if ($compression === 'lz4' && ! defined('\Redis::COMPRESSION_LZ4')) {
             throw new \InvalidArgumentException("LZ4 compression is not supported by your version of phpredis.");
+        }
+
+        if ($compression === 'none' && ! defined('\Redis::COMPRESSION_NONE')) {
+            throw new \InvalidArgumentException("NONE compression is not supported by your version of phpredis.");
         }
 
         $this->compression = $compression;
@@ -738,14 +749,14 @@ final class RedisClient implements RedisInterface
     public function allValues()
     {
         try {
-            $keys = $this->connection()->keys('*');
+            $keys = $this->allKeys();
             $result = array_map(function ($key) {
                 return $this->get($key);
             }, $keys);
                     
             return array_combine($keys, $result);
-        } catch (\Exception $e) {
-            throw new RedisConnectionException();
+        } catch (\RedisException $e) {
+            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
         }
     }
 
@@ -758,8 +769,48 @@ final class RedisClient implements RedisInterface
     {
         try {
             return $this->connection()->keys('*');
-        } catch (\Exception $e) {
-            throw new RedisConnectionException();
+        } catch (\RedisException $e) {
+            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
+        }
+    }
+
+    /**
+     * Gets the DB size (optionally for a specific database), in terms of keys count.
+     *
+     * @param int|null $dbIndex database index
+     *
+     * @return int - the size of the database, in terms of keys count
+     *
+     * @throws RedisConnectionException exception on connection to redis instance
+     */
+    public function dbSize(?int $dbIndex = null) : int
+    {
+        try {
+            // if the $database is not empty, select it
+            if (! is_null($dbIndex)) {
+                // save the current database index
+                $activeDbIndex = $this->connection()->getDbNum();
+
+                // select the new database
+                if(! $this->connection()->select($dbIndex)) {
+                    throw new RedisConnectionException("Could not select database {$dbIndex}");
+                }
+
+                // get the database size
+                $dbSize = $this->connection()->dbSize();
+
+                // restore the previous database
+                if ($activeDbIndex !== false) {
+                    $this->connection()->select($activeDbIndex);
+                }
+            } else {
+                // get the database size
+                $dbSize = $this->connection()->dbSize();
+            }
+
+            return $dbSize;
+        } catch (\RedisException $e) {
+            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
         }
     }
 
@@ -768,12 +819,60 @@ final class RedisClient implements RedisInterface
      *
      * @return void
      */
-    public function flushAll()
+    public function flushAllAsync()
     {
         try {
             $this->connection()->rawCommand('FLUSHALL', 'ASYNC');
-        } catch (\Exception $e) {
-            throw new RedisConnectionException();
+        } catch (\RedisException $e) {
+            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
+        }
+    }
+
+    /**
+     * Flush all Redis keys
+     *
+     * @return void
+     */
+    public function flushAll()
+    {
+        try {
+            $this->connection()->flushAll();
+        } catch (\RedisException $e) {
+            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
+        }
+    }
+
+    /**
+     * Flush all Redis keys from a specific database
+     *
+     * @return void
+     */
+    public function flushDb(?int $dbIndex = null) : void
+    {
+        try {
+            // if the $database is not empty, select it
+            if (! is_null($dbIndex)) {
+                // save the current database index
+                $activeDbIndex = $this->connection()->getDbNum();
+
+                // select the new database
+                if(! $this->connection()->select($dbIndex)) {
+                    throw new RedisConnectionException("Could not select database {$dbIndex}");
+                }
+
+                // flush the database
+                $this->connection()->flushDb();
+
+                // restore the previous database
+                if ($activeDbIndex !== false) {
+                    $this->connection()->select($activeDbIndex);
+                }
+            } else {
+                // flush the current database
+                $this->connection()->flushDb();
+            }
+        } catch (\RedisException $e) {
+            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
         }
     }
 
@@ -843,6 +942,7 @@ final class RedisClient implements RedisInterface
      *
      * @throws RedisImpossibleValueException exception on impossible value
      * @throws RedisConnectionException exception on connection to redis instance
+     * @throws BaseRedisException exception on redis exception
      */
     public function incr(string $key, int $value = 1) : int
     {
@@ -857,8 +957,8 @@ final class RedisClient implements RedisInterface
             }
 
             throw new RedisImpossibleValueException();
-        } catch (\RedisException $ex) {
-            throw new RedisConnectionException();
+        } catch (\RedisException $e) {
+            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
         }
     }
 
@@ -871,6 +971,7 @@ final class RedisClient implements RedisInterface
      *
      * @throws RedisImpossibleValueException exception on impossible value
      * @throws RedisConnectionException exception on connection to redis instance
+     * @throws BaseRedisException exception on redis exception
      */
     public function decr(string $key, int $value = 1) : int
     {
@@ -885,8 +986,8 @@ final class RedisClient implements RedisInterface
             }
 
             throw new RedisImpossibleValueException();
-        } catch (\RedisException $ex) {
-            throw new RedisConnectionException();
+        } catch (\RedisException $e) {
+            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
         }
     }
 
@@ -899,6 +1000,7 @@ final class RedisClient implements RedisInterface
      *
      * @throws RedisImpossibleValueException exception on impossible value
      * @throws RedisConnectionException exception on connection to redis instance
+     * @throws BaseRedisException exception on redis exception
      */
     public function append(string $key, $value) : int
     {
@@ -909,8 +1011,8 @@ final class RedisClient implements RedisInterface
             }
 
             throw new RedisImpossibleValueException();
-        } catch (\RedisException $ex) {
-            throw new RedisConnectionException();
+        } catch (\RedisException $e) {
+            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
         }
     }
 
@@ -923,6 +1025,7 @@ final class RedisClient implements RedisInterface
      *
      * @throws RedisConnectionException exception on connection to redis instance
      * @throws RedisKeyNotFoundException when key not found
+     * @throws BaseRedisException exception on redis exception
      */
     public function get(string $key)
     {
@@ -933,8 +1036,8 @@ final class RedisClient implements RedisInterface
             }
 
             return $this->decode($result);
-        } catch (\RedisException $ex) {
-            throw new RedisConnectionException();
+        } catch (\RedisException $e) {
+            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
         }
     }
 
@@ -946,6 +1049,7 @@ final class RedisClient implements RedisInterface
      *
      * @throws RedisConnectionException exception on connection to redis instance
      * @throws RedisImpossibleValueException when impossible value
+     * @throws BaseRedisException exception on redis exception
      */
     public function mget(array $keys)
     {
@@ -958,8 +1062,8 @@ final class RedisClient implements RedisInterface
             }
 
             throw new RedisImpossibleValueException();
-        } catch (\RedisException $ex) {
-            throw new RedisConnectionException();
+        } catch (\RedisException $e) {
+            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
         }
     }
 
@@ -972,6 +1076,7 @@ final class RedisClient implements RedisInterface
      *
      * @throws RedisConnectionException exception on connection to redis instance
      * @throws RedisImpossibleValueException exception on impossible value
+     * @throws BaseRedisException exception on redis exception
      */
     public function set(string $key, $value)
     {
@@ -987,8 +1092,8 @@ final class RedisClient implements RedisInterface
             }
 
             throw new RedisImpossibleValueException();
-        } catch (\RedisException $ex) {
-            throw new RedisConnectionException();
+        } catch (\RedisException $e) {
+            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
         }
     }
 
@@ -999,6 +1104,7 @@ final class RedisClient implements RedisInterface
      * @return bool operation result
      *
      * @throws RedisConnectionException exception on connection to redis instance
+     * @throws BaseRedisException exception on redis exception
      */
     public function mset(array $values)
     {
@@ -1015,8 +1121,8 @@ final class RedisClient implements RedisInterface
 
                 return $this->connection()->mset($values);
             }
-        } catch (\RedisException $ex) {
-            throw new RedisConnectionException();
+        } catch (\RedisException $e) {
+            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
         }
     }
 
@@ -1028,6 +1134,7 @@ final class RedisClient implements RedisInterface
      * @return bool returns true, if operation complete succesfull, else false
      *
      * @throws RedisConnectionException exception on connection to redis instance
+     * @throws BaseRedisException exception on redis exception
      */
     public function setnx(string $key, $value)
     {
@@ -1039,8 +1146,8 @@ final class RedisClient implements RedisInterface
             }
 
             return $result;
-        } catch (\RedisException $ex) {
-            throw new RedisConnectionException();
+        } catch (\RedisException $e) {
+            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
         }
     }
 
@@ -1051,6 +1158,7 @@ final class RedisClient implements RedisInterface
      * @return bool operation result
      *
      * @throws RedisConnectionException exception on connection to redis instance
+     * @throws BaseRedisException exception on redis exception
      */
     public function msetnx(array $values)
     {
@@ -1067,8 +1175,8 @@ final class RedisClient implements RedisInterface
             $values = array_map([$this, 'encode'], $values);
 
             return $this->connection()->msetnx($values);
-        } catch (\RedisException $ex) {
-            throw new RedisConnectionException();
+        } catch (\RedisException $e) {
+            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
         }
     }
 
@@ -1080,13 +1188,14 @@ final class RedisClient implements RedisInterface
      * @return bool|mixed previous value of a key. If key did not set, method returns false
      *
      * @throws RedisConnectionException exception on connection to redis instance
+     * @throws BaseRedisException exception on redis exception
      */
     public function getset(string $key, $value)
     {
         try {
             return $this->connection()->getSet($key, $this->encode($value));
-        } catch (\RedisException $ex) {
-            throw new RedisConnectionException();
+        } catch (\RedisException $e) {
+            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
         }
     }
 
@@ -1097,6 +1206,8 @@ final class RedisClient implements RedisInterface
      * @return int count of deleted keys
      *
      * @throws RedisConnectionException exception on connection to redis instance
+     * @throws RedisImpossibleValueException exception on impossible value
+     * @throws BaseRedisException exception on redis exception
      */
     public function delete($keys)
     {
@@ -1107,8 +1218,8 @@ final class RedisClient implements RedisInterface
             }
 
             throw new RedisImpossibleValueException();
-        } catch (\RedisException $ex) {
-            throw new RedisConnectionException();
+        } catch (\RedisException $e) {
+            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
         }
     }
 
@@ -1119,6 +1230,7 @@ final class RedisClient implements RedisInterface
      * @return bool check result
      *
      * @throws RedisConnectionException exception on connection to redis instance
+     * @throws BaseRedisException exception on redis exception
      */
     public function exists(string $key) : bool
     {
@@ -1131,8 +1243,8 @@ final class RedisClient implements RedisInterface
             }
 
             return $exists;
-        } catch (\RedisException $ex) {
-            throw new RedisConnectionException();
+        } catch (\RedisException $e) {
+            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
         }
     }
 
@@ -1144,13 +1256,14 @@ final class RedisClient implements RedisInterface
      * @return bool operation result. If false, source key not found
      *
      * @throws RedisConnectionException exception on connection to redis instance
+     * @throws BaseRedisException exception on redis exception
      */
     public function rename(string $source, string $destination)
     {
         try {
             return $this->connection()->rename($source, $destination);
-        } catch (\RedisException $ex) {
-            throw new RedisConnectionException();
+        } catch (\RedisException $e) {
+            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
         }
     }
 
@@ -1162,13 +1275,14 @@ final class RedisClient implements RedisInterface
      * @return bool operation result. If false, source key not found or needed key name found
      *
      * @throws RedisConnectionException exception on connection to redis instance
+     * @throws BaseRedisException exception on redis exception
      */
     public function renamenx(string $source, string $destination)
     {
         try {
             return $this->connection()->renamenx($source, $destination);
-        } catch (\RedisException $ex) {
-            throw new RedisConnectionException();
+        } catch (\RedisException $e) {
+            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
         }
     }
 
@@ -1180,6 +1294,7 @@ final class RedisClient implements RedisInterface
      *
      * @throws RedisConnectionException exception on connection to redis instance
      * @throws RedisImpossibleValueException exception on impossible value
+     * @throws BaseRedisException exception on redis exception
      */
     public function strlen(string $key)
     {
@@ -1190,8 +1305,8 @@ final class RedisClient implements RedisInterface
             }
 
             throw new RedisImpossibleValueException();
-        } catch (\RedisException $ex) {
-            throw new RedisConnectionException();
+        } catch (\RedisException $e) {
+            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
         }
     }
 
@@ -1203,13 +1318,14 @@ final class RedisClient implements RedisInterface
      * @return bool operation result. If false ttl cound not be set, or key not found
      *
      * @throws RedisConnectionException exception on connection to redis instance
+     * @throws BaseRedisException exception on redis exception
      */
     public function expire(string $key, int $timeout)
     {
         try {
             return $this->connection()->pexpire($key, $timeout);
-        } catch (\RedisException $ex) {
-            throw new RedisConnectionException();
+        } catch (\RedisException $e) {
+            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
         }
     }
 
@@ -1221,13 +1337,14 @@ final class RedisClient implements RedisInterface
      * @return bool operation result. If false timestamp cound not be set, or key not found
      *
      * @throws RedisConnectionException exception on connection to redis instance
+     * @throws BaseRedisException exception on redis exception
      */
     public function expireat(string $key, int $timestamp)
     {
         try {
             return $this->connection()->expireat($key, $timestamp);
-        } catch (\RedisException $ex) {
-            throw new RedisConnectionException();
+        } catch (\RedisException $e) {
+            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
         }
     }
 
@@ -1238,6 +1355,7 @@ final class RedisClient implements RedisInterface
      * @return int|bool ttl in milliseconds or false, if ttl is not set or key not found
      *
      * @throws RedisConnectionException exception on connection to redis instance
+     * @throws BaseRedisException exception on redis exception
      */
     public function ttl(string $key)
     {
@@ -1245,8 +1363,8 @@ final class RedisClient implements RedisInterface
             $result = $this->connection()->pttl($key);
 
             return ($result != -1) ? $result : false;
-        } catch (\RedisException $ex) {
-            throw new RedisConnectionException();
+        } catch (\RedisException $e) {
+            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
         }
     }
 
@@ -1257,13 +1375,14 @@ final class RedisClient implements RedisInterface
      * @return bool if true ttl was removed successful, if false ttl did not set, or key not found
      *
      * @throws RedisConnectionException exception on connection to redis instance
+     * @throws BaseRedisException exception on redis exception
      */
     public function persist(string $key)
     {
         try {
             return $this->connection()->persist($key);
-        } catch (\RedisException $ex) {
-            throw new RedisConnectionException();
+        } catch (\RedisException $e) {
+            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
         }
     }
 
@@ -1276,6 +1395,7 @@ final class RedisClient implements RedisInterface
      *
      * @throws RedisConnectionException exception on connection to redis instance
      * @throws RedisImpossibleValueException exception on impossible value
+     * @throws BaseRedisException exception on redis exception
      */
     public function getbit(string $key, int $offset) : int
     {
@@ -1288,8 +1408,8 @@ final class RedisClient implements RedisInterface
             }
 
             throw new RedisImpossibleValueException();
-        } catch (\RedisException $ex) {
-            throw new RedisConnectionException();
+        } catch (\RedisException $e) {
+            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
         }
     }
 
@@ -1303,6 +1423,7 @@ final class RedisClient implements RedisInterface
      *
      * @throws RedisConnectionException exception on connection to redis instance
      * @throws RedisImpossibleValueException exception on impossible value
+     * @throws BaseRedisException exception on redis exception
      */
     public function setbit(string $key, int $offset, int $value) : int
     {
@@ -1316,8 +1437,8 @@ final class RedisClient implements RedisInterface
             }
 
             throw new RedisImpossibleValueException();
-        } catch (\RedisException $ex) {
-            throw new RedisConnectionException();
+        } catch (\RedisException $e) {
+            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
         }
     }
 
@@ -1330,6 +1451,7 @@ final class RedisClient implements RedisInterface
      *
      * @throws RedisConnectionException exception on connection to redis instance
      * @throws RedisScriptExecutionException when script execution faled
+     * @throws BaseRedisException exception on redis exception
      */
     public function evaluate(string $code, array $arguments = [])
     {
@@ -1347,8 +1469,8 @@ final class RedisClient implements RedisInterface
             }
 
             throw new RedisScriptExecutionException($lastError);
-        } catch (\RedisException $ex) {
-            throw new RedisConnectionException();
+        } catch (\RedisException $e) {
+            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
         }
     }
 
@@ -1361,6 +1483,7 @@ final class RedisClient implements RedisInterface
      *
      * @throws RedisConnectionException exception on connection to redis instance
      * @throws RedisScriptExecutionException when script execution faled
+     * @throws BaseRedisException exception on redis exception
      */
     public function evalSha(string $sha, array $arguments = [])
     {
@@ -1378,8 +1501,8 @@ final class RedisClient implements RedisInterface
             }
 
             throw new RedisScriptExecutionException($lastError);
-        } catch (\RedisException $ex) {
-            throw new RedisConnectionException();
+        } catch (\RedisException $e) {
+            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
         }
     }
 
@@ -1392,6 +1515,7 @@ final class RedisClient implements RedisInterface
      *
      * @throws RedisConnectionException exception on connection to redis instance
      * @throws RedisImpossibleValueException exception on impossible value
+     * @throws BaseRedisException exception on redis exception
      */
     public function sadd(string $key, $member)
     {
@@ -1402,8 +1526,8 @@ final class RedisClient implements RedisInterface
             }
 
             throw new RedisImpossibleValueException();
-        } catch (\RedisException $ex) {
-            throw new RedisConnectionException();
+        } catch (\RedisException $e) {
+            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
         }
     }
 
@@ -1414,13 +1538,14 @@ final class RedisClient implements RedisInterface
      * @return mixed set member
      *
      * @throws RedisConnectionException exception on connection to redis instance
+     * @throws BaseRedisException exception on redis exception
      */
     public function spop(string $key)
     {
         try {
             return $this->connection()->sPop($key);
-        } catch (\RedisException $ex) {
-            throw new RedisConnectionException();
+        } catch (\RedisException $e) {
+            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
         }
     }
 
@@ -1431,13 +1556,14 @@ final class RedisClient implements RedisInterface
      * @return mixed set member
      *
      * @throws RedisConnectionException exception on connection to redis instance
+     * @throws BaseRedisException exception on redis exception
      */
     public function srandmember(string $key)
     {
         try {
             return $this->connection()->sRandMember($key);
-        } catch (\RedisException $ex) {
-            throw new RedisConnectionException();
+        } catch (\RedisException $e) {
+            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
         }
     }
 
@@ -1448,13 +1574,14 @@ final class RedisClient implements RedisInterface
      * @return int members count of the set
      *
      * @throws RedisConnectionException exception on connection to redis instance
+     * @throws BaseRedisException exception on redis exception
      */
     public function scard(string $key)
     {
         try {
             return $this->connection()->sCard($key);
-        } catch (\RedisException $ex) {
-            throw new RedisConnectionException();
+        } catch (\RedisException $e) {
+            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
         }
     }
 
@@ -1466,13 +1593,14 @@ final class RedisClient implements RedisInterface
      * @return bool check result
      *
      * @throws RedisConnectionException exception on connection to redis instance
+     * @throws BaseRedisException exception on redis exception
      */
     public function sismembers(string $key, $member)
     {
         try {
-            return $this->connection()->sIsMember($key);
-        } catch (\RedisException $ex) {
-            throw new RedisConnectionException();
+            return $this->connection()->sIsMember($key, $member);
+        } catch (\RedisException $e) {
+            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
         }
     }
 
@@ -1483,13 +1611,14 @@ final class RedisClient implements RedisInterface
      * @return array all members of the set
      *
      * @throws RedisConnectionException exception on connection to redis instance
+     * @throws BaseRedisException exception on redis exception
      */
     public function smembers(string $key)
     {
         try {
             return $this->connection()->sMembers($key);
-        } catch (\RedisException $ex) {
-            throw new RedisConnectionException();
+        } catch (\RedisException $e) {
+            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
         }
     }
 
@@ -1501,13 +1630,14 @@ final class RedisClient implements RedisInterface
      * @return int count of removed elements
      *
      * @throws RedisConnectionException exception on connection to redis instance
+     * @throws BaseRedisException exception on redis exception
      */
     public function srem(string $key, $member)
     {
         try {
             return $this->connection()->sRem($key);
-        } catch (\RedisException $ex) {
-            throw new RedisConnectionException();
+        } catch (\RedisException $e) {
+            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
         }
     }
 
@@ -1519,6 +1649,8 @@ final class RedisClient implements RedisInterface
      * @return int size of result set
      *
      * @throws RedisConnectionException exception on connection to redis instance
+     * @throws RedisImpossibleValueException exception on impossible value
+     * @throws BaseRedisException exception on redis exception
      */
     public function sdiffstore(string $destination, array $sources)
     {
@@ -1527,8 +1659,54 @@ final class RedisClient implements RedisInterface
                 $this->connection(),
                 'sDiffStore',
             ], array_merge([$destination], $sources));
-        } catch (\RedisException $ex) {
-            throw new RedisConnectionException();
+        } catch (\RedisException $e) {
+            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
+        }
+    }
+
+    /**
+     * Create intersection set
+     *
+     * @param string $destination key for result set
+     * @param array $sources source keys
+     * @return int size of result set
+     *
+     * @throws RedisConnectionException exception on connection to redis instance
+     * @throws RedisImpossibleValueException exception on impossible value
+     * @throws BaseRedisException exception on redis exception
+     */
+    public function sinterstore(string $destination, array $sources)
+    {
+        try {
+            return call_user_func_array([
+                $this->connection(),
+                'sInterStore',
+            ], array_merge([$destination], $sources));
+        } catch (\RedisException $e) {
+            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
+        }
+    }
+
+    /**
+     * Create union set
+     *
+     * @param string $destination key for result set
+     * @param array $sources source keys
+     * @return int size of result set
+     *
+     * @throws RedisConnectionException exception on connection to redis instance
+     * @throws RedisImpossibleValueException exception on impossible value
+     * @throws BaseRedisException exception on redis exception
+     */
+    public function sunionstore(string $destination, array $sources)
+    {
+        try {
+            return call_user_func_array([
+                $this->connection(),
+                'sUnionStore',
+            ], array_merge([$destination], $sources));
+        } catch (\RedisException $e) {
+            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
         }
     }
 }

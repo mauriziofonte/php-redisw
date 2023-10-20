@@ -4704,7 +4704,6 @@ class Redis
     /**
      * Send arbitrary things to the redis server.
      *
-     * @param string $command   Required command to send to the server.
      * @param mixed  $arguments Optional variable amount of arguments to send to the server.
      *
      * @return mixed
@@ -4715,7 +4714,7 @@ class Redis
      * $redis->rawCommand('GET", 'key'); // string(5) "value"
      * </pre>
      */
-    public function rawCommand($command, $arguments)
+    public function rawCommand(...$arguments)
     {
     }
 

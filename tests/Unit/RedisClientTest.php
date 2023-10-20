@@ -18,6 +18,16 @@ class RedisClientTest extends TestCase
         $this->assertEquals(1, $this->baseClient->getDbIndex());
     }
 
+    public function testFlushDb()
+    {
+        $this->baseClient->set('test', 'test');
+        $this->baseClient->set('ping', 'pong');
+        $this->baseClient->flushDb();
+
+        $this->assertEquals([], $this->baseClient->allKeys());
+        $this->assertEquals(0, $this->baseClient->dbSize());
+    }
+
     public function testSetKeyPrefix()
     {
         $this->baseClient->setKeyPrefix('keyprefix');
@@ -34,6 +44,7 @@ class RedisClientTest extends TestCase
 
         $this->assertEquals('keyprefix', $this->baseClient->getKeyPrefix());
         $this->assertEquals(1, $this->baseClient->getDbIndex());
+        $this->assertEquals('test', $this->baseClient->get('test'));
     }
 
     public function testSetLzfCompression()
@@ -100,6 +111,7 @@ class RedisClientTest extends TestCase
             $whatever = $this->baseClient->get('key_that_does_not_exist');
         } catch(\Exception $e) {
             $this->assertTrue(true);
+
             return;
         }
 
