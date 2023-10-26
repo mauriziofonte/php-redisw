@@ -108,9 +108,14 @@ final class RedisClient implements RedisInterface
     private $misses = 0;
 
     /**
+     * @var bool force revalidate - If it is set to true, then all calls to "has" and "exists" will return false
+     */
+    private $forceRevalidate = false;
+
+    /**
      * Static Redisw factory method
      *
-     * @param array $config [host, port, connect_timeout, connect_tries, persistent, db_index, cache_ttl, auth_password, ssl, key_prefix]
+     * @param array $config [host, port, connect_timeout, connect_tries, persistent, db_index, cache_ttl, auth, ssl, key_prefix, compression, serializer, force_revalidate]
      *
      * @return self
      */
@@ -153,6 +158,9 @@ final class RedisClient implements RedisInterface
         }
         if (array_key_exists('serializer', $config)) {
             $client->setSerializer($config['serializer']);
+        }
+        if (array_key_exists('force_revalidate', $config)) {
+            $client->setForceRevalidate($config['force_revalidate']);
         }
 
         return $client;
@@ -718,6 +726,30 @@ final class RedisClient implements RedisInterface
     }
 
     /**
+     * Setter of force revalidate parameter
+     *
+     * @param bool $forceRevalidate force revalidate - If it is set to true, then all calls to "has" and "exists" will return false
+     *
+     * @return RedisClient self
+     */
+    public function setForceRevalidate(bool $forceRevalidate) : RedisClient
+    {
+        $this->forceRevalidate = $forceRevalidate;
+
+        return $this;
+    }
+
+    /**
+     * Getter of force revalidate parameter
+     *
+     * @return bool force revalidate - If it is set to true, then all calls to "has" and "exists" will return false
+     */
+    public function getForceRevalidate() : bool
+    {
+        return $this->forceRevalidate;
+    }
+
+    /**
      * Getter of cache hits (keys found when checking for has() or exists())
      *
      * @return int
@@ -768,7 +800,11 @@ final class RedisClient implements RedisInterface
     public function allKeys()
     {
         try {
-            return $this->connection()->keys('*');
+            if (! $this->forceRevalidate) {
+                return $this->connection()->keys('*');
+            }
+            
+            return [];
         } catch (\RedisException $e) {
             throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
         }
@@ -1235,7 +1271,7 @@ final class RedisClient implements RedisInterface
     public function exists(string $key) : bool
     {
         try {
-            $exists = $this->connection()->exists($key);
+            $exists = (! $this->forceRevalidate) ? $this->connection()->exists($key) : false;
             if ($exists) {
                 $this->hits++;
             } else {
