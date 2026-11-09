@@ -1,20 +1,49 @@
 {
     "name": "mfonte/redisw",
-    "description": "A Redis Client implementation library, built on top of the phpredis PECL package.",
+    "description": "An expressive, strictly-typed Redis client built on top of the phpredis PECL extension, with first-class caching helpers.",
     "keywords": [
         "php",
         "redis",
-        "phpredis"
+        "phpredis",
+        "cache",
+        "client",
+        "wrapper",
+        "psr-16",
+        "simple-cache"
     ],
     "type": "library",
     "license": "Apache-2.0",
+    "homepage": "https://github.com/mauriziofonte/php-redisw",
     "authors": [
         {
             "name": "Maurizio Fonte",
-            "email": "fonte.maurizio@gmail.com"
+            "email": "fonte.maurizio@gmail.com",
+            "homepage": "https://github.com/mauriziofonte",
+            "role": "Developer"
         }
     ],
-    "minimum-stability": "stable",
+    "support": {
+        "issues": "https://github.com/mauriziofonte/php-redisw/issues",
+        "source": "https://github.com/mauriziofonte/php-redisw",
+        "security": "https://github.com/mauriziofonte/php-redisw/security/policy"
+    },
+    "require": {
+        "php": "^8.1",
+        "ext-redis": ">=5.3",
+        "psr/simple-cache": "^2.0 || ^3.0"
+    },
+    "require-dev": {
+        "friendsofphp/php-cs-fixer": "^3.40",
+        "phpstan/phpstan": "^2.0",
+        "phpunit/phpunit": "^10.5 || ^11.0"
+    },
+    "provide": {
+        "psr/simple-cache-implementation": "2.0 || 3.0"
+    },
+    "suggest": {
+        "ext-igbinary": "Faster and more compact serialization (serializer: igbinary)",
+        "ext-msgpack": "MessagePack serialization (serializer: msgpack)"
+    },
     "autoload": {
         "psr-4": {
             "Mfonte\\Redisw\\": "src/"
@@ -25,20 +54,27 @@
             "Mfonte\\Redisw\\Test\\": "tests/"
         }
     },
-    "require": {
-        "php": "^8.1",
-        "ext-redis": ">=2.2.7"
-    },
-    "require-dev": {
-        "friendsofphp/php-cs-fixer": "^3.4",
-        "phpstan/phpstan": "^1.9",
-        "mockery/mockery": "^1.3.3",
-        "orchestra/testbench": "^7.0",
-        "phpunit/phpunit": "^9.5"
+    "minimum-stability": "stable",
+    "prefer-stable": true,
+    "config": {
+        "sort-packages": true
     },
     "scripts": {
-        "fix": "@php vendor/bin/php-cs-fixer fix",
         "test": "@php vendor/bin/phpunit --colors=always",
-        "analyse": "@php vendor/bin/phpstan analyse src --level 4"
+        "analyse": "@php vendor/bin/phpstan analyse --memory-limit=1G",
+        "cs": "@php vendor/bin/php-cs-fixer fix --dry-run --diff",
+        "fix": "@php vendor/bin/php-cs-fixer fix",
+        "check": [
+            "@cs",
+            "@analyse",
+            "@test"
+        ]
+    },
+    "scripts-descriptions": {
+        "test": "Run the test suite (requires a running Redis server)",
+        "analyse": "Run PHPStan static analysis",
+        "cs": "Check coding style without modifying files",
+        "fix": "Fix coding style",
+        "check": "Run coding style check, static analysis and tests"
     }
 }

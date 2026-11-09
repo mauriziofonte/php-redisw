@@ -1,5 +1,7 @@
 <?php
 
+declare(strict_types=1);
+
 namespace Mfonte\Redisw;
 
 use Mfonte\Redisw\Exception\RedisConnectionException;
@@ -10,128 +12,168 @@ use Mfonte\Redisw\Exception\RedisNotConfiguredException;
 use Mfonte\Redisw\Exception\RedisScriptExecutionException;
 use Mfonte\Redisw\Exception\RedisTriesOverConnectException;
 use Mfonte\Redisw\Interfaces\RedisInterface;
-use Mfonte\Redisw\Spec\Redis;
 
 /**
- * Redis Wrapper on the phpredis extension.
+ * Redis wrapper around the phpredis extension.
  *
  * @author Maurizio Fonte <fonte.maurizio@gmail.com>
- * @date 2023-03-21
  */
 final class RedisClient implements RedisInterface
 {
     /**
-     * Pre-defined redis cache ttl seconds
-     *
-     * @var int
+     * Default cache TTL, in seconds, used when no "cache_ttl" is given to {@see RedisClient::instance()}.
      */
-    private static $defaultRedisCacheTtlSeconds = 60;
+    public const DEFAULT_CACHE_TTL_SECONDS = 60;
 
     /**
-     * @var bool are we correctly connected to redis, or not
+     * Lower and upper bounds (milliseconds) of the random jitter added to every TTL, to avoid cache stampedes.
      */
+    private const TTL_JITTER_MIN_MS = 10000;
+    private const TTL_JITTER_MAX_MS = 99000;
+
+    /**
+     * Number of keys fetched per SCAN / MGET round trip in {@see RedisClient::allKeys()} and {@see RedisClient::allValues()}.
+     */
+    private const SCAN_BATCH_SIZE = 1000;
+
+    /**
+     * Sentinels used to safely store values that phpredis can't round-trip (null, false, true).
+     */
+    private const NULL_SENTINEL = '##REDIS__NULL__VAR##';
+    private const FALSE_SENTINEL = '##REDIS__FALSE__VAR##';
+    private const TRUE_SENTINEL = '##REDIS__TRUE__VAR##';
+
+    /**
+     * Supported serializers, mapped to the name of the matching \Redis constant.
+     */
+    private const SERIALIZERS = [
+        'none' => 'SERIALIZER_NONE',
+        'php' => 'SERIALIZER_PHP',
+        'igbinary' => 'SERIALIZER_IGBINARY',
+        'json' => 'SERIALIZER_JSON',
+        'msgpack' => 'SERIALIZER_MSGPACK',
+    ];
+
+    /**
+     * Supported compression algorithms, mapped to the name of the matching \Redis constant.
+     */
+    private const COMPRESSIONS = [
+        'none' => 'COMPRESSION_NONE',
+        'lzf' => 'COMPRESSION_LZF',
+        'zstd' => 'COMPRESSION_ZSTD',
+        'lz4' => 'COMPRESSION_LZ4',
+    ];
+
+    /**
+     * Configuration keys accepted by {@see RedisClient::instance()}.
+     */
+    private const CONFIG_KEYS = [
+        'host',
+        'port',
+        'connect_timeout',
+        'connect_tries',
+        'read_timeout',
+        'persistent',
+        'db_index',
+        'cache_ttl',
+        'cache_ttl_jitter',
+        'auth',
+        'auth_password',
+        'username',
+        'ssl',
+        'ssl_context',
+        'key_prefix',
+        'compression',
+        'serializer',
+        'force_revalidate',
+    ];
+
     private bool $isConnected = false;
 
-    /**
-     * @var string redis instance hostname
-     */
     private string $host = '';
 
-    /**
-     * @var int redis instance port
-     */
     private int $port = -1;
 
-    /**
-     * @var float redis instance connect timeout
-     */
-    private float $connectTimeout = 0;
+    private float $connectTimeout = 0.0;
 
-    /**
-     * @var int number of tries for connect to redis instance
-     */
-    private $connectTries = 1;
+    private float $readTimeout = 0.0;
 
-    /**
-     * @var bool use persistence connection, or not
-     */
+    private int $connectTries = 1;
+
     private bool $persistent = false;
 
-    /**
-     * @var int|null redis instance database index
-     */
     private ?int $dbIndex = null;
 
     /**
-     * @var int redis instance cache ttl
+     * Cache TTL in seconds. 0 means "no expiration".
      */
-    private int $cacheTTL = 0;
+    private int $cacheTtlSeconds = 0;
 
-    /**
-     * @var string redis instance auth password
-     */
+    private bool $cacheTtlJitter = true;
+
     private string $auth = '';
 
+    private string $username = '';
+
     /**
-     * @var bool use ssl connection, or not
+     * @var array<string, mixed> SSL stream context options (see https://www.php.net/manual/en/context.ssl.php)
      */
+    private array $sslContext = [];
+
     private bool $ssl = false;
 
-    /**
-     * @var string redis key prefix
-     */
     private string $keyPrefix = '';
 
-    /**
-     * @var string|null compression method
-     */
     private ?string $compression = null;
 
-    /**
-     * @var string|null serializer method
-     */
     private ?string $serializer = null;
 
-    /**
-     * @var Redis phpredis object instance
-     */
     private ?\Redis $phpredis = null;
 
-    /**
-     * @var int number of hits
-     */
-    private $hits = 0;
+    private int $hits = 0;
+
+    private int $misses = 0;
 
     /**
-     * @var int number of misses
+     * If true, all calls to has(), exists() and allKeys() behave as if the key space were empty.
      */
-    private $misses = 0;
+    private bool $forceRevalidate = false;
 
     /**
-     * @var bool force revalidate - If it is set to true, then all calls to "has" and "exists" will return false
-     */
-    private $forceRevalidate = false;
-
-    /**
-     * Static Redisw factory method
+     * Static factory method.
      *
-     * @param array $config [host, port, connect_timeout, connect_tries, persistent, db_index, cache_ttl, auth, ssl, key_prefix, compression, serializer, force_revalidate]
+     * @param array<string, mixed> $config Accepted keys: host, port, connect_timeout, connect_tries, read_timeout,
+     *                                     persistent, db_index, cache_ttl, cache_ttl_jitter, auth (alias: auth_password),
+     *                                     username, ssl, ssl_context, key_prefix, compression, serializer, force_revalidate
      *
-     * @return self
+     * @throws \InvalidArgumentException if "host" or "port" are missing, or if an unknown/invalid option is given
      */
-    public static function instance(array $config) : self
+    public static function instance(array $config): self
     {
         if (! array_key_exists('host', $config) || ! array_key_exists('port', $config)) {
-            throw new \InvalidArgumentException();
+            throw new \InvalidArgumentException('The "host" and "port" configuration keys are required.');
+        }
+
+        $unknown = array_diff(array_keys($config), self::CONFIG_KEYS);
+        if ($unknown !== []) {
+            throw new \InvalidArgumentException(sprintf(
+                'Unknown configuration key(s): %s. Accepted keys are: %s.',
+                implode(', ', $unknown),
+                implode(', ', self::CONFIG_KEYS)
+            ));
         }
 
         $client = new self();
         $client->setHost($config['host'])->setPort($config['port']);
+
         if (array_key_exists('connect_timeout', $config)) {
             $client->setConnectTimeout($config['connect_timeout']);
         }
         if (array_key_exists('connect_tries', $config)) {
             $client->setConnectTries($config['connect_tries']);
+        }
+        if (array_key_exists('read_timeout', $config)) {
+            $client->setReadTimeout($config['read_timeout']);
         }
         if (array_key_exists('persistent', $config)) {
             $client->setPersistent($config['persistent']);
@@ -139,16 +181,23 @@ final class RedisClient implements RedisInterface
         if (array_key_exists('db_index', $config)) {
             $client->setDbIndex($config['db_index']);
         }
-        if (array_key_exists('cache_ttl', $config)) {
-            $client->setCacheTTL($config['cache_ttl']);
-        } else {
-            $client->setCacheTTL(self::$defaultRedisCacheTtlSeconds);
+        if (array_key_exists('cache_ttl_jitter', $config)) {
+            $client->setCacheTTLJitter($config['cache_ttl_jitter']);
         }
+        $client->setCacheTTL($config['cache_ttl'] ?? self::DEFAULT_CACHE_TTL_SECONDS);
         if (array_key_exists('auth', $config)) {
             $client->setAuthPassword($config['auth']);
+        } elseif (array_key_exists('auth_password', $config)) {
+            $client->setAuthPassword($config['auth_password']);
+        }
+        if (array_key_exists('username', $config)) {
+            $client->setUsername($config['username']);
         }
         if (array_key_exists('ssl', $config)) {
             $client->setSsl($config['ssl']);
+        }
+        if (array_key_exists('ssl_context', $config)) {
+            $client->setSslContext($config['ssl_context']);
         }
         if (array_key_exists('key_prefix', $config)) {
             $client->setKeyPrefix($config['key_prefix']);
@@ -167,231 +216,329 @@ final class RedisClient implements RedisInterface
     }
 
     /**
-     * Getter of phpredis object
+     * Lazily returns the connected phpredis instance.
      *
-     * @return Redis phpredis object instance
-     *
-     * @throws RedisNotConfiguredException if any of required redis connect parameters are loose
+     * @throws RedisNotConfiguredException if host or port are not configured
+     * @throws RedisConnectionException    if the connection could not be established
      */
-    private function connection()
+    private function connection(): \Redis
     {
-        if (is_null($this->phpredis)) {
-            if ($this->isConfigured()) {
-                $this->reconnect();
-            } else {
-                throw new RedisNotConfiguredException();
+        if ($this->phpredis === null) {
+            if (! $this->isConfigured()) {
+                throw new RedisNotConfiguredException('Redis host and port must be configured before connecting.');
             }
+
+            $this->reconnect();
         }
 
+        /** @var \Redis */
         return $this->phpredis;
     }
 
-    /**
-     * Check required connection parameters configuration method
-     *
-     * @return bool check result
-     */
-    private function isConfigured() : bool
+    private function isConfigured(): bool
     {
-        return ! empty($this->host) && $this->port >= 0 && $this->port <= 65535;
+        return $this->host !== '' && $this->port >= 0 && $this->port <= 65535;
     }
 
     /**
-     * Reconnect to the redis instance
+     * (Re)connects to the Redis instance, retrying up to "connect_tries" times.
      *
-     * @return bool connection result. Always true.
-     *
-     * @throws RedisConnectionException if connection could not established by RedisException cause
-     * @throws RedisTriesOverConnectException if connection could not established because tries was over
+     * @throws RedisTriesOverConnectException if the connection could not be established within the allowed tries
+     * @throws RedisConnectionException       if the connection was established but could not be configured
      */
-    private function reconnect() : bool
+    private function reconnect(): void
     {
-        $tries = 0;
-        do {
-            // increment tries counter
-            $tries++;
+        $this->phpredis = null;
+        $this->isConnected = false;
+
+        if ($this->username !== '' && $this->auth === '') {
+            throw new RedisNotConfiguredException('A password ("auth") is required when a username is configured.');
+        }
+
+        $host = $this->ssl ? 'tls://' . $this->host : $this->host;
+        $lastError = null;
+
+        for ($attempt = 1; $attempt <= $this->connectTries; $attempt++) {
+            $redis = new \Redis();
 
             try {
-                // create new phpredis object
-                $this->phpredis = new \Redis();
-
-                // set host (with tls:// prefix if ssl is true)
-                $host = ($this->ssl) ? 'tls://' . $this->host : $this->host;
-                
-                if ($this->persistent) {
-                    $this->phpredis->pconnect($host, $this->port, $this->connectTimeout);
-                } else {
-                    $this->phpredis->connect($host, $this->port, $this->connectTimeout);
+                if (! $this->open($redis, $host)) {
+                    throw new RedisConnectionException(sprintf('Could not connect to %s:%d.', $host, $this->port));
                 }
 
-                // check if we have to authenticate
-                if (! empty($this->auth)) {
-                    $this->phpredis->auth($this->auth);
+                if ($this->auth !== '') {
+                    $credentials = $this->username !== '' ? [$this->username, $this->auth] : $this->auth;
+                    if (! $redis->auth($credentials)) {
+                        throw new RedisConnectionException('Redis authentication failed.');
+                    }
                 }
 
-                // check if we have a DB index to select
-                if ($this->dbIndex !== null) {
-                    $this->phpredis->select($this->dbIndex);
-                }
-                
-                // check if we have a Key prefix
-                if (! empty($this->keyPrefix)) {
-                    $this->phpredis->setOption(\Redis::OPT_PREFIX, $this->keyPrefix);
+                if ($redis->ping('pong') !== 'pong') {
+                    throw new RedisConnectionException('Redis ping test failed.');
                 }
 
-                // check if we have a Serializer
-                switch($this->serializer) {
-                    case 'igbinary':
-                        $serializer = \Redis::SERIALIZER_IGBINARY;
+                $this->phpredis = $redis;
+                $this->applyOptions();
+                $this->isConnected = true;
 
-                        break;
-                    case 'json':
-                        $serializer = \Redis::SERIALIZER_JSON;
+                return;
+            } catch (\RedisException | RedisConnectionException $e) {
+                $lastError = $e;
+                $this->phpredis = null;
 
-                        break;
-                    case 'php':
-                        $serializer = \Redis::SERIALIZER_PHP;
-
-                        break;
-                    default:
-                        $serializer = \Redis::SERIALIZER_NONE;
+                try {
+                    $redis->close();
+                } catch (\Throwable) {
+                    // no-op: we are already handling a failure
                 }
-                $this->phpredis->setOption(\Redis::OPT_SERIALIZER, $serializer);
-
-                // set compression mode
-                switch($this->compression) {
-                    case 'lzf':
-                        $compression = \Redis::COMPRESSION_LZF;
-
-                        break;
-                    case 'zstd':
-                        $compression = \Redis::COMPRESSION_ZSTD;
-
-                        break;
-                    case 'lz4':
-                        $compression = \Redis::COMPRESSION_LZ4;
-
-                        break;
-                    default:
-                        $compression = \Redis::COMPRESSION_NONE;
-                }
-                $this->phpredis->setOption(\Redis::OPT_COMPRESSION, $compression);
-
-                // test ping to check if connection is ok
-                if ($this->phpredis->ping('pong') === 'pong') {
-                    $this->isConnected = true;
-
-                    return true;
-                } else {
-                    throw new RedisConnectionException("Redis Ping test failed");
-                }
-            } catch (\RedisException $ex) {
-                throw new BaseRedisException("Redis Connection failed: " . $ex->getMessage(), $ex->getCode(), $ex);
             }
-        } while ($tries <= $this->connectTries);
+        }
 
-        $this->phpredis = null;
-
-        throw new RedisTriesOverConnectException("Redis Connection failed after {$tries} tries");
+        throw new RedisTriesOverConnectException(
+            sprintf(
+                'Redis connection to %s:%d failed after %d attempt(s): %s',
+                $host,
+                $this->port,
+                $this->connectTries,
+                $lastError !== null ? $lastError->getMessage() : 'unknown error'
+            ),
+            0,
+            $lastError
+        );
     }
 
     /**
-     * Encodes a value to be stored inside a Redis key.
-     * This is to avoid issues with serialization of null, false and true, and to avoid errors while getting the value back from Redis.
-     * In fact, literal FALSE is considered as an exception.
-     *
-     * @param mixed $value
-     *
-     * @return mixed
+     * Opens the TCP/TLS/unix socket connection.
      */
-    private function encode($value)
+    private function open(\Redis $redis, string $host): bool
     {
-        if (is_null($value)) {
-            return '##REDIS__NULL__VAR##';
-        }
-        if ($value === false) {
-            return '##REDIS__FALSE__VAR##';
-        }
-        if ($value === true) {
-            return '##REDIS__TRUE__VAR##';
+        if ($this->ssl && $this->sslContext !== []) {
+            $context = ['stream' => $this->sslContext];
+
+            return $this->persistent
+                ? $redis->pconnect($host, $this->port, $this->connectTimeout, null, 0, $this->readTimeout, $context)
+                : $redis->connect($host, $this->port, $this->connectTimeout, null, 0, $this->readTimeout, $context);
         }
 
-        return $value;
+        return $this->persistent
+            ? $redis->pconnect($host, $this->port, $this->connectTimeout, null, 0, $this->readTimeout)
+            : $redis->connect($host, $this->port, $this->connectTimeout, null, 0, $this->readTimeout);
     }
 
     /**
-     * Decodes a value stored inside a Redis key.
+     * Applies db index, key prefix, serializer and compression to the live connection, if any.
      *
-     * @param mixed $value
-     *
-     * @return mixed
+     * @throws RedisConnectionException if the configured database can't be selected
      */
-    private function decode($value)
+    private function applyOptions(): void
     {
-        if ($value === '##REDIS__NULL__VAR##') {
-            return null;
-        }
-        if ($value === '##REDIS__FALSE__VAR##') {
-            return false;
-        }
-        if ($value === '##REDIS__TRUE__VAR##') {
-            return true;
+        if ($this->phpredis === null) {
+            return;
         }
 
-        return $value;
+        try {
+            if ($this->dbIndex !== null && ! $this->phpredis->select($this->dbIndex)) {
+                throw new RedisConnectionException(sprintf('Could not select database %d.', $this->dbIndex));
+            }
+
+            $this->phpredis->setOption(\Redis::OPT_PREFIX, $this->keyPrefix);
+            $this->phpredis->setOption(\Redis::OPT_SCAN, \Redis::SCAN_RETRY);
+            $this->phpredis->setOption(\Redis::OPT_SERIALIZER, self::redisConstant(self::SERIALIZERS[$this->serializer ?? 'none']));
+            $this->phpredis->setOption(\Redis::OPT_COMPRESSION, self::redisConstant(self::COMPRESSIONS[$this->compression ?? 'none']));
+        } catch (\RedisException $e) {
+            throw new RedisConnectionException('Could not configure the Redis connection: ' . $e->getMessage(), (int) $e->getCode(), $e);
+        }
     }
 
     /**
-     * Getter of isConnected parameter
-     *
-     * @return bool
+     * Drops the current connection (if any), so that the next command reconnects with the new parameters.
      */
-    public function getIsConnected() : bool
+    private function dropConnection(): void
+    {
+        if ($this->phpredis !== null) {
+            $this->disconnect();
+        }
+    }
+
+    private static function redisConstant(string $name): int
+    {
+        $fqcn = '\Redis::' . $name;
+        if (! defined($fqcn)) {
+            throw new \InvalidArgumentException(sprintf('\Redis::%s is not supported by your version of phpredis.', $name));
+        }
+
+        $value = constant($fqcn);
+
+        return is_int($value) ? $value : throw new \InvalidArgumentException(sprintf('\\Redis::%s is not an integer constant.', $name));
+    }
+
+    /**
+     * Encodes a value so that null, false and true survive a round trip through Redis.
+     * Literal FALSE, in particular, is what phpredis returns for a missing key.
+     */
+    private function encode(mixed $value): mixed
+    {
+        return match (true) {
+            $value === null => self::NULL_SENTINEL,
+            $value === false => self::FALSE_SENTINEL,
+            $value === true => self::TRUE_SENTINEL,
+            default => $value,
+        };
+    }
+
+    /**
+     * Decodes a value previously encoded by {@see RedisClient::encode()}.
+     */
+    private function decode(mixed $value): mixed
+    {
+        return match ($value) {
+            self::NULL_SENTINEL => null,
+            self::FALSE_SENTINEL => false,
+            self::TRUE_SENTINEL => true,
+            default => $value,
+        };
+    }
+
+    /**
+     * Effective TTL, in milliseconds, to apply to a write. 0 means "no expiration".
+     * The jitter is computed per write, so that keys written together don't expire together.
+     */
+    private function effectiveTtlMs(): int
+    {
+        if ($this->cacheTtlSeconds === 0) {
+            return 0;
+        }
+
+        $jitter = $this->cacheTtlJitter ? random_int(self::TTL_JITTER_MIN_MS, self::TTL_JITTER_MAX_MS) : 0;
+
+        return $this->cacheTtlSeconds * 1000 + $jitter;
+    }
+
+    /**
+     * TTL, in milliseconds, for a write: the explicit $ttl (seconds, no jitter) or the configured cache TTL.
+     *
+     * @throws \InvalidArgumentException if $ttl is negative
+     */
+    private function ttlMs(?int $ttl): int
+    {
+        if ($ttl === null) {
+            return $this->effectiveTtlMs();
+        }
+
+        if ($ttl < 0) {
+            throw new \InvalidArgumentException('Invalid ttl value. Ttl must be a non-negative number of seconds.');
+        }
+
+        return $ttl * 1000;
+    }
+
+    /**
+     * Runs $callback against $dbIndex (if given), restoring the previously selected database afterwards.
+     *
+     * @template T
+     *
+     * @param callable(\Redis): T $callback
+     *
+     * @return T
+     */
+    private function onDatabase(?int $dbIndex, callable $callback): mixed
+    {
+        $redis = $this->connection();
+
+        if ($dbIndex === null) {
+            return $callback($redis);
+        }
+
+        $activeDbIndex = self::toInt($redis->getDbNum());
+        if (! $redis->select($dbIndex)) {
+            throw new RedisConnectionException(sprintf('Could not select database %d.', $dbIndex));
+        }
+
+        try {
+            return $callback($redis);
+        } finally {
+            $redis->select($activeDbIndex);
+        }
+    }
+
+    /**
+     * Normalizes a phpredis integer reply (phpredis may also return false, or itself when in MULTI mode).
+     */
+    private static function toInt(mixed $value): int
+    {
+        return is_int($value) ? $value : 0;
+    }
+
+    private static function wrapException(\RedisException $e): BaseRedisException
+    {
+        return new BaseRedisException($e->getMessage(), (int) $e->getCode(), $e);
+    }
+
+    /*
+     * configuration
+     */
+
+    /**
+     * Whether a connection to Redis is currently established.
+     */
+    public function getIsConnected(): bool
     {
         return $this->isConnected;
     }
 
     /**
-     * Setter of connection timeout parameter
-     *
-     * @param float $connectTimeout connection timeout value
+     * @param mixed $connectTimeout connection timeout in seconds (numeric, >= 0). 0 means "no timeout".
      *
      * @throws \InvalidArgumentException
-     * @return RedisClient self
      */
-    public function setConnectTimeout($connectTimeout) : RedisClient
+    public function setConnectTimeout(mixed $connectTimeout): self
     {
-        if (! is_numeric($connectTimeout) || (float)$connectTimeout < 0) {
-            throw new \InvalidArgumentException("Invalid connect timeout value. Connect timeout value must be a positive float.");
+        if (! is_numeric($connectTimeout) || (float) $connectTimeout < 0) {
+            throw new \InvalidArgumentException('Invalid connect timeout value. Connect timeout value must be a positive float.');
         }
-        
+
         $this->connectTimeout = (float) $connectTimeout;
+        $this->dropConnection();
 
         return $this;
     }
 
-    /**
-     * Getter of connection timeout exception
-     *
-     * @return float connect timeout value
-     */
-    public function getConnectTimeout() : float
+    public function getConnectTimeout(): float
     {
         return $this->connectTimeout;
     }
 
     /**
-     * Setter of number of connection tries
-     *
-     * @param int $connectTries connection tries count
+     * @param mixed $readTimeout read timeout in seconds (numeric, >= 0). 0 means "use the default_socket_timeout ini setting".
      *
      * @throws \InvalidArgumentException
-     * @return RedisClient self
      */
-    public function setConnectTries($connectTries) : RedisClient
+    public function setReadTimeout(mixed $readTimeout): self
     {
-        if (! is_numeric($connectTries) || (int)$connectTries < 1) {
-            throw new \InvalidArgumentException("Invalid connect tries value. Connect tries value must be a positive integer.");
+        if (! is_numeric($readTimeout) || (float) $readTimeout < 0) {
+            throw new \InvalidArgumentException('Invalid read timeout value. Read timeout value must be a positive float.');
+        }
+
+        $this->readTimeout = (float) $readTimeout;
+        $this->dropConnection();
+
+        return $this;
+    }
+
+    public function getReadTimeout(): float
+    {
+        return $this->readTimeout;
+    }
+
+    /**
+     * @param mixed $connectTries number of connection attempts (integer, >= 1)
+     *
+     * @throws \InvalidArgumentException
+     */
+    public function setConnectTries(mixed $connectTries): self
+    {
+        if (! is_numeric($connectTries) || (int) $connectTries < 1) {
+            throw new \InvalidArgumentException('Invalid connect tries value. Connect tries value must be a positive integer.');
         }
 
         $this->connectTries = (int) $connectTries;
@@ -399,372 +546,356 @@ final class RedisClient implements RedisInterface
         return $this;
     }
 
-    /**
-     * Getter of number of connection tries
-     *
-     * @return int connection tries count
-     */
-    public function getConnectTries() : int
+    public function getConnectTries(): int
     {
         return $this->connectTries;
     }
 
     /**
-     * Setter for redis instance hostname or ip address
-     *
-     * @param string $host hostname or ip address
+     * @param mixed $host hostname, IP address or unix socket path (non-empty string)
      *
      * @throws \InvalidArgumentException
-     * @return RedisClient self
      */
-    public function setHost($host) : RedisClient
+    public function setHost(mixed $host): self
     {
-        if (! is_string($host) || empty($host)) {
-            throw new \InvalidArgumentException("Invalid host value. Host value must be a non empty string.");
+        if (! is_string($host) || $host === '') {
+            throw new \InvalidArgumentException('Invalid host value. Host value must be a non empty string.');
         }
 
-        $this->host = (string) $host;
+        $this->host = $host;
+        $this->dropConnection();
 
         return $this;
     }
 
-    /**
-     * Getter of redis instance hostname
-     *
-     * @return string redis instance hostname or ip address
-     */
-    public function getHost() : ?string
+    public function getHost(): string
     {
         return $this->host;
     }
 
     /**
-     * Setter of redis instance connection port
-     *
-     * @param int $port redis instance connection port
+     * @param mixed $port TCP port (integer between 0 and 65535; use 0 for unix sockets)
      *
      * @throws \InvalidArgumentException
-     * @return RedisClient self
      */
-    public function setPort($port) : RedisClient
+    public function setPort(mixed $port): self
     {
-        if (! is_numeric($port) || (int)$port < 0 || (int)$port > 65535) {
-            throw new \InvalidArgumentException("Invalid port value. Port value must be a number between 0 and 65535.");
+        if (! is_numeric($port) || (int) $port < 0 || (int) $port > 65535) {
+            throw new \InvalidArgumentException('Invalid port value. Port value must be a number between 0 and 65535.');
         }
 
-        $this->port = $port;
+        $this->port = (int) $port;
+        $this->dropConnection();
 
         return $this;
     }
 
-    /**
-     * Getter of redis instance connection port
-     *
-     * @return int redis instance connection port
-     */
-    public function getPort() : int
+    public function getPort(): int
     {
         return $this->port;
     }
 
     /**
-     * Setter of redis instance connection ssl
-     *
-     * @param bool $ssl redis instance connection ssl
-     *
-     * @return RedisClient self
+     * @throws \InvalidArgumentException
      */
-    public function setSsl($ssl) : RedisClient
+    public function setSsl(mixed $ssl): self
     {
         if (! is_bool($ssl)) {
-            throw new \InvalidArgumentException("Invalid ssl value. Ssl value must be a true/false boolean.");
+            throw new \InvalidArgumentException('Invalid ssl value. Ssl value must be a true/false boolean.');
         }
 
         $this->ssl = $ssl;
+        $this->dropConnection();
 
         return $this;
     }
 
-    /**
-     * Getter of redis instance connection ssl
-     *
-     * @return bool redis instance connection ssl
-     */
-    public function getSsl() : bool
+    public function getSsl(): bool
     {
         return $this->ssl;
     }
 
     /**
-     * Setter of redis instance Authentication
-     *
-     * @param string $auth redis instance authentication
-     *
-     * @return RedisClient self
+     * @throws \InvalidArgumentException
      */
-    public function setAuthPassword($auth) : RedisClient
+    public function setAuthPassword(mixed $auth): self
     {
-        if (! is_string($auth) || empty($auth)) {
-            throw new \InvalidArgumentException("Invalid authentication. Auth password must be a non empty string.");
+        if (! is_string($auth) || $auth === '') {
+            throw new \InvalidArgumentException('Invalid authentication. Auth password must be a non empty string.');
         }
-        
+
         $this->auth = $auth;
+        $this->dropConnection();
 
         return $this;
     }
 
-    /**
-     * Getter of redis instance Authentication
-     *
-     * @return string|null redis instance Authentication
-     */
-    public function getAuth() : ?string
+    public function getAuth(): string
     {
         return $this->auth;
     }
 
     /**
-     * Use persistent connection or not
+     * Sets the ACL username (Redis >= 6). Requires a password, see {@see RedisClient::setAuthPassword()}.
      *
-     * @param bool $persistent if is set to true, pconnect will use, overwise not
-     *
-     * @return RedisClient self
+     * @throws \InvalidArgumentException
      */
-    public function setPersistent($persistent) : RedisClient
+    public function setUsername(mixed $username): self
     {
-        if (! is_bool($persistent)) {
-            throw new \InvalidArgumentException("Invalid persistent value. Persistent value must be a true/false boolean.");
+        if (! is_string($username) || $username === '') {
+            throw new \InvalidArgumentException('Invalid username. Username must be a non empty string.');
         }
 
-        $this->persistent = $persistent;
+        $this->username = $username;
+        $this->dropConnection();
+
+        return $this;
+    }
+
+    public function getUsername(): string
+    {
+        return $this->username;
+    }
+
+    /**
+     * Sets the SSL stream context options used when "ssl" is enabled,
+     * e.g. ['cafile' => '/path/ca.pem', 'verify_peer_name' => true, 'local_cert' => '/path/client.pem'].
+     *
+     * @see https://www.php.net/manual/en/context.ssl.php
+     *
+     * @param mixed $sslContext array of SSL context options, indexed by option name
+     *
+     * @throws \InvalidArgumentException
+     */
+    public function setSslContext(mixed $sslContext): self
+    {
+        if (! is_array($sslContext)) {
+            throw new \InvalidArgumentException('Invalid ssl context. Ssl context must be an array of SSL context options.');
+        }
+
+        $context = [];
+        foreach ($sslContext as $option => $value) {
+            if (! is_string($option)) {
+                throw new \InvalidArgumentException('Invalid ssl context. Ssl context options must be indexed by option name.');
+            }
+            $context[$option] = $value;
+        }
+
+        $this->sslContext = $context;
+        $this->dropConnection();
 
         return $this;
     }
 
     /**
-     * Use persistent connection or not
-     *
-     * @return bool if is set to true, pconnect will use, overwise not
+     * @return array<string, mixed>
      */
-    public function getPersistent() : bool
+    public function getSslContext(): array
+    {
+        return $this->sslContext;
+    }
+
+    /**
+     * @param mixed $persistent boolean: if true, pconnect() is used instead of connect()
+     *
+     * @throws \InvalidArgumentException
+     */
+    public function setPersistent(mixed $persistent): self
+    {
+        if (! is_bool($persistent)) {
+            throw new \InvalidArgumentException('Invalid persistent value. Persistent value must be a true/false boolean.');
+        }
+
+        $this->persistent = $persistent;
+        $this->dropConnection();
+
+        return $this;
+    }
+
+    public function getPersistent(): bool
     {
         return $this->persistent;
     }
 
     /**
-     * Setter of redis instance Database Index
+     * Selects the database index. If already connected, the database is switched immediately.
      *
-     * @param int $dbIndex redis instance Database Index
+     * @param mixed $dbIndex a non-negative integer (the upper bound depends on the "databases" Redis setting)
      *
-     * @return RedisClient self
+     * @throws \InvalidArgumentException
+     * @throws RedisConnectionException  if already connected and the database can't be selected
      */
-    public function setDbIndex($dbIndex) : RedisClient
+    public function setDbIndex(mixed $dbIndex): self
     {
-        if (! is_numeric($dbIndex) || (int)$dbIndex < 0 || (int)$dbIndex > 15) {
-            throw new \InvalidArgumentException("Invalid database index. Database index must be a positive integer between 0 and 15.");
+        if (! is_numeric($dbIndex) || (int) $dbIndex < 0) {
+            throw new \InvalidArgumentException('Invalid database index. Database index must be a non-negative integer.');
         }
 
         $this->dbIndex = (int) $dbIndex;
+        $this->applyOptions();
 
         return $this;
     }
 
     /**
-     * Getter of redis instance Database Index
-     *
-     * @return int redis instance Database Index
+     * @return int|null the configured database index, or null if none was configured (Redis defaults to 0)
      */
-    public function getDbIndex() : int
+    public function getDbIndex(): ?int
     {
         return $this->dbIndex;
     }
 
     /**
-     * Setter of cache ttl
+     * Sets the cache TTL applied to every write (set, mset, setnx, msetnx, getset).
      *
-     * @param int $ttl cache ttl
+     * @param mixed $ttl TTL in seconds (integer, >= 0). 0 means "no expiration".
      *
-     * @return RedisClient self
+     * @throws \InvalidArgumentException
      */
-    public function setCacheTTL($ttl) : RedisClient
+    public function setCacheTTL(mixed $ttl): self
     {
-        if (! is_numeric($ttl) || (int)$ttl < 0) {
-            throw new \InvalidArgumentException("Invalid cache ttl value. Ttl must be a positive integer representing the number of seconds of cache lifetime.");
+        if (! is_numeric($ttl) || (int) $ttl < 0) {
+            throw new \InvalidArgumentException('Invalid cache ttl value. Ttl must be a positive integer representing the number of seconds of cache lifetime.');
         }
 
-        // ttl must be converted to milliseconds.
-        // we're also adding a random value between 10 and 99 seconds to avoid cache stampede
-        $ttl = (int) $ttl * 1000 + rand(10000, 99000);
-
-        $this->cacheTTL = $ttl;
+        $this->cacheTtlSeconds = (int) $ttl;
 
         return $this;
     }
 
     /**
-     * Getter of cache ttl
-     *
-     * @return int cache ttl
+     * @return int the configured cache TTL, in seconds (0 means "no expiration"), without jitter
      */
-    public function getCacheTTL() : int
+    public function getCacheTTL(): int
     {
-        return $this->cacheTTL;
+        return $this->cacheTtlSeconds;
     }
 
     /**
-     * Setter of Redis Compression.
-     * Valid compression values are: lzf, zstd, lz4
+     * Enables or disables the random 10-99 seconds jitter added to every TTL to avoid cache stampedes.
      *
-     * @param string $compression compression
-     *
-     * @return RedisClient self
+     * @throws \InvalidArgumentException
      */
-    public function setCompression($compression) : RedisClient
+    public function setCacheTTLJitter(mixed $jitter): self
     {
-        if (! is_string($compression) || ! in_array($compression, ['lzf', 'zstd', 'lz4', 'none'])) {
-            throw new \InvalidArgumentException("Invalid compression value. Valid values are: lzf, zstd, lz4, none");
+        if (! is_bool($jitter)) {
+            throw new \InvalidArgumentException('Invalid cache ttl jitter value. It must be a true/false boolean.');
         }
 
-        if ($compression === 'lzf' && ! defined('\Redis::COMPRESSION_LZF')) {
-            throw new \InvalidArgumentException("LZF compression is not supported by your version of phpredis.");
+        $this->cacheTtlJitter = $jitter;
+
+        return $this;
+    }
+
+    public function getCacheTTLJitter(): bool
+    {
+        return $this->cacheTtlJitter;
+    }
+
+    /**
+     * Sets the compression algorithm. Valid values are: none, lzf, zstd, lz4.
+     *
+     * @throws \InvalidArgumentException if the value is invalid or not supported by the installed phpredis
+     */
+    public function setCompression(mixed $compression): self
+    {
+        if (! is_string($compression) || ! array_key_exists($compression, self::COMPRESSIONS)) {
+            throw new \InvalidArgumentException('Invalid compression value. Valid values are: ' . implode(', ', array_keys(self::COMPRESSIONS)));
         }
 
-        if ($compression === 'zstd' && ! defined('\Redis::COMPRESSION_ZSTD')) {
-            throw new \InvalidArgumentException("ZSTD compression is not supported by your version of phpredis.");
-        }
-
-        if ($compression === 'lz4' && ! defined('\Redis::COMPRESSION_LZ4')) {
-            throw new \InvalidArgumentException("LZ4 compression is not supported by your version of phpredis.");
-        }
-
-        if ($compression === 'none' && ! defined('\Redis::COMPRESSION_NONE')) {
-            throw new \InvalidArgumentException("NONE compression is not supported by your version of phpredis.");
-        }
+        self::redisConstant(self::COMPRESSIONS[$compression]);
 
         $this->compression = $compression;
+        $this->applyOptions();
 
         return $this;
     }
 
-    /**
-     * Getter of Redis Compression.
-     * Valid compression values are: lzf, zstd, lz4
-     *
-     * @return string|null compression
-     */
-    public function getCompression() : ?string
+    public function getCompression(): ?string
     {
         return $this->compression;
     }
 
     /**
-     * Setter of key prefix
-     *
-     * @param string $keyPrefix key prefix
-     *
-     * @return RedisClient self
+     * Sets the key prefix. The prefix is normalized to a lowercase slug made of [a-z0-9-].
      */
-    public function setKeyPrefix(string $keyPrefix) : RedisClient
+    public function setKeyPrefix(mixed $keyPrefix): self
     {
-        // the key prefix must be a slugged string
-        $keyPrefix = preg_replace('/[^a-z0-9\-]/', '-', strtolower($keyPrefix));
-        $keyPrefix = trim(preg_replace('/\-+/', '-', $keyPrefix), '-');
+        if (! is_string($keyPrefix)) {
+            throw new \InvalidArgumentException('Invalid key prefix value. Key prefix must be a string.');
+        }
+
+        $keyPrefix = (string) preg_replace('/[^a-z0-9\-]/', '-', strtolower($keyPrefix));
+        $keyPrefix = trim((string) preg_replace('/\-+/', '-', $keyPrefix), '-');
 
         $this->keyPrefix = $keyPrefix;
+        $this->applyOptions();
 
         return $this;
     }
 
-    /**
-     * Getter of key prefix
-     *
-     * @return string|null key prefix
-     */
-    public function getKeyPrefix() : ?string
+    public function getKeyPrefix(): string
     {
         return $this->keyPrefix;
     }
 
     /**
-     * Setter of serializer
+     * Sets the serializer. Valid values are: none, php, igbinary, json, msgpack.
      *
-     * @param string $serializer serializer
-     *
-     * @return RedisClient self
+     * @throws \InvalidArgumentException if the value is invalid or not supported by the installed phpredis
      */
-    public function setSerializer(string $serializer) : RedisClient
+    public function setSerializer(mixed $serializer): self
     {
-        if (! in_array($serializer, ['json', 'igbinary', 'php'])) {
-            throw new \InvalidArgumentException("Invalid serializer value. Valid values are: json, igbinary, php");
+        if (! is_string($serializer) || ! array_key_exists($serializer, self::SERIALIZERS)) {
+            throw new \InvalidArgumentException('Invalid serializer value. Valid values are: ' . implode(', ', array_keys(self::SERIALIZERS)));
         }
 
-        if ($serializer === 'igbinary' && ! defined('\Redis::SERIALIZER_IGBINARY')) {
-            throw new \InvalidArgumentException("Igbinary serializer is not supported by your version of phpredis.");
-        }
-
-        if ($serializer === 'json' && ! defined('\Redis::SERIALIZER_JSON')) {
-            throw new \InvalidArgumentException("JSON serializer is not supported by your version of phpredis.");
-        }
-
-        if ($serializer === 'php' && ! defined('\Redis::SERIALIZER_PHP')) {
-            throw new \InvalidArgumentException("PHP serializer is not supported by your version of phpredis.");
-        }
+        self::redisConstant(self::SERIALIZERS[$serializer]);
 
         $this->serializer = $serializer;
+        $this->applyOptions();
 
         return $this;
     }
 
-    /**
-     * Getter of serializer
-     *
-     * @return string serializer
-     */
-    public function getSerializer() : ?string
+    public function getSerializer(): ?string
     {
         return $this->serializer;
     }
 
     /**
-     * Setter of force revalidate parameter
+     * @param mixed $forceRevalidate boolean: if true, has(), exists() and allKeys() behave as if the key space were empty
      *
-     * @param bool $forceRevalidate force revalidate - If it is set to true, then all calls to "has" and "exists" will return false
-     *
-     * @return RedisClient self
+     * @throws \InvalidArgumentException
      */
-    public function setForceRevalidate(bool $forceRevalidate) : RedisClient
+    public function setForceRevalidate(mixed $forceRevalidate): self
     {
+        if (! is_bool($forceRevalidate)) {
+            throw new \InvalidArgumentException('Invalid force revalidate value. It must be a true/false boolean.');
+        }
+
         $this->forceRevalidate = $forceRevalidate;
 
         return $this;
     }
 
-    /**
-     * Getter of force revalidate parameter
-     *
-     * @return bool force revalidate - If it is set to true, then all calls to "has" and "exists" will return false
-     */
-    public function getForceRevalidate() : bool
+    public function getForceRevalidate(): bool
     {
         return $this->forceRevalidate;
     }
 
     /**
-     * Getter of cache hits (keys found when checking for has() or exists())
-     *
-     * @return int
+     * Number of keys found by has() / exists().
      */
-    public function getHits() : int
+    public function getHits(): int
     {
         return $this->hits;
     }
 
     /**
-     * Getter of cache misses (keys not found when checking for has() or exists())
-     *
-     * @return int
+     * Number of keys not found by has() / exists().
      */
-    public function getMisses() : int
+    public function getMisses(): int
     {
         return $this->misses;
     }
@@ -774,193 +905,189 @@ final class RedisClient implements RedisInterface
      */
 
     /**
-     * Get all keys and relative values
+     * Gets all keys (without the configured key prefix) and their values.
+     * Keys holding non-string values (hashes, sets, ...) are returned with a false value.
      *
-     * @return array
+     * @return array<string, mixed>
+     *
+     * @throws BaseRedisException
      */
-    public function allValues()
+    public function allValues(): array
     {
-        try {
-            $keys = $this->allKeys();
-            $result = array_map(function ($key) {
-                return $this->get($key);
-            }, $keys);
-                    
-            return array_combine($keys, $result);
-        } catch (\RedisException $e) {
-            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
+        $result = [];
+        foreach (array_chunk($this->allKeys(), self::SCAN_BATCH_SIZE) as $keys) {
+            $result += $this->mget($keys);
         }
+
+        return $result;
     }
 
     /**
-     * Get all keys
+     * Gets all keys of the current database (without the configured key prefix), using non-blocking SCAN.
      *
-     * @return array
+     * @return list<string>
+     *
+     * @throws BaseRedisException
      */
-    public function allKeys()
+    public function allKeys(): array
     {
-        try {
-            if (! $this->forceRevalidate) {
-                return $this->connection()->keys('*');
-            }
-            
+        if ($this->forceRevalidate) {
             return [];
-        } catch (\RedisException $e) {
-            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
         }
+
+        return $this->scanKeys();
     }
 
     /**
-     * Gets the DB size (optionally for a specific database), in terms of keys count.
+     * Deletes all the keys of the configured key prefix, or of the whole current database when no prefix is configured.
+     * Unlike {@see RedisClient::flushDb()}, keys belonging to other prefixes are preserved.
      *
-     * @param int|null $dbIndex database index
+     * @return int number of deleted keys
      *
-     * @return int - the size of the database, in terms of keys count
-     *
-     * @throws RedisConnectionException exception on connection to redis instance
+     * @throws BaseRedisException
      */
-    public function dbSize(?int $dbIndex = null) : int
+    public function deleteAll(): int
+    {
+        $deleted = 0;
+        foreach (array_chunk($this->scanKeys(), self::SCAN_BATCH_SIZE) as $keys) {
+            $deleted += $this->delete($keys);
+        }
+
+        return $deleted;
+    }
+
+    /**
+     * @return list<string> all keys of the current database matching the prefix, without the prefix
+     *
+     * @throws BaseRedisException
+     */
+    private function scanKeys(): array
     {
         try {
-            // if the $database is not empty, select it
-            if (! is_null($dbIndex)) {
-                // save the current database index
-                $activeDbIndex = $this->connection()->getDbNum();
+            $redis = $this->connection();
+            $prefixLength = strlen($this->keyPrefix);
+            $pattern = $prefixLength > 0 ? $this->keyPrefix . '*' : '*';
+            $keys = [];
+            $iterator = null;
 
-                // select the new database
-                if(! $this->connection()->select($dbIndex)) {
-                    throw new RedisConnectionException("Could not select database {$dbIndex}");
+            while (($batch = $redis->scan($iterator, $pattern, self::SCAN_BATCH_SIZE)) !== false) {
+                foreach ($batch as $key) {
+                    $keys[(string) substr((string) $key, $prefixLength)] = true;
                 }
-
-                // get the database size
-                $dbSize = $this->connection()->dbSize();
-
-                // restore the previous database
-                if ($activeDbIndex !== false) {
-                    $this->connection()->select($activeDbIndex);
-                }
-            } else {
-                // get the database size
-                $dbSize = $this->connection()->dbSize();
             }
 
-            return $dbSize;
+            return array_map('strval', array_keys($keys));
         } catch (\RedisException $e) {
-            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
+            throw self::wrapException($e);
         }
     }
 
     /**
-     * Flush all Redis keys asynchronously
+     * Gets the number of keys of the current database, or of $dbIndex if given.
      *
-     * @return void
+     * @throws RedisConnectionException
+     * @throws BaseRedisException
      */
-    public function flushAllAsync()
+    public function dbSize(?int $dbIndex = null): int
+    {
+        try {
+            return $this->onDatabase($dbIndex, static fn (\Redis $redis): int => self::toInt($redis->dbSize()));
+        } catch (\RedisException $e) {
+            throw self::wrapException($e);
+        }
+    }
+
+    /**
+     * Flushes all databases asynchronously.
+     *
+     * @throws BaseRedisException
+     */
+    public function flushAllAsync(): void
     {
         try {
             $this->connection()->rawCommand('FLUSHALL', 'ASYNC');
         } catch (\RedisException $e) {
-            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
+            throw self::wrapException($e);
         }
     }
 
     /**
-     * Flush all Redis keys
+     * Flushes all databases.
      *
-     * @return void
+     * @throws BaseRedisException
      */
-    public function flushAll()
+    public function flushAll(): void
     {
         try {
             $this->connection()->flushAll();
         } catch (\RedisException $e) {
-            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
+            throw self::wrapException($e);
         }
     }
 
     /**
-     * Flush all Redis keys from a specific database
+     * Flushes the current database, or $dbIndex if given.
      *
-     * @return void
+     * @throws RedisConnectionException
+     * @throws BaseRedisException
      */
-    public function flushDb(?int $dbIndex = null) : void
+    public function flushDb(?int $dbIndex = null): void
     {
         try {
-            // if the $database is not empty, select it
-            if (! is_null($dbIndex)) {
-                // save the current database index
-                $activeDbIndex = $this->connection()->getDbNum();
-
-                // select the new database
-                if(! $this->connection()->select($dbIndex)) {
-                    throw new RedisConnectionException("Could not select database {$dbIndex}");
-                }
-
-                // flush the database
-                $this->connection()->flushDb();
-
-                // restore the previous database
-                if ($activeDbIndex !== false) {
-                    $this->connection()->select($activeDbIndex);
-                }
-            } else {
-                // flush the current database
-                $this->connection()->flushDb();
-            }
+            $this->onDatabase($dbIndex, static fn (\Redis $redis) => $redis->flushDB());
         } catch (\RedisException $e) {
-            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
+            throw self::wrapException($e);
         }
     }
 
     /**
-     * Disconnect from Redis
-     *
-     * @return void
+     * Closes the connection, if any. Never throws, and never opens a connection.
      */
-    public function disconnect()
+    public function disconnect(): void
     {
-        try {
-            $this->connection()->close();
-        } catch (\Exception $e) {
-            // no-op. Do not throw exception on disconnect
+        if ($this->phpredis !== null) {
+            try {
+                $this->phpredis->close();
+            } catch (\Throwable) {
+                // no-op: do not throw exceptions on disconnect
+            }
         }
+
+        $this->phpredis = null;
+        $this->isConnected = false;
     }
 
     /**
-     * Check if a key exists
+     * Alias of {@see RedisClient::exists()}.
      *
-     * @param string $key key
-     *
-     * @return bool
+     * @throws BaseRedisException
      */
-    public function has(string $key) : bool
+    public function has(string $key): bool
     {
         return $this->exists($key);
     }
 
     /**
-     * Wrap a call to a specific Redis command, by passing the command name and the arguments.
-     * This method will return the result of the command, or null if the command fails, silently catching any exception.
-     * This method will throw an InvalidArgumentException if the command does not exist.
+     * Calls a public method of this client, returning null instead of throwing if the call fails.
      *
-     * @param string $command command name
-     * @param mixed $args command arguments
+     * @param string $command public method name, e.g. "get"
+     * @param mixed  ...$args method arguments
      *
-     * @return mixed
+     * @throws \InvalidArgumentException if $command is not a public method of this class
      */
-    public function wrap()
+    public function wrap(string $command, mixed ...$args): mixed
     {
-        $args = func_get_args();
-        $command = array_shift($args);
+        if (! method_exists($this, $command)
+            || ! (new \ReflectionMethod($this, $command))->isPublic()
+            || strcasecmp($command, 'wrap') === 0
+            || strcasecmp($command, 'instance') === 0
+        ) {
+            throw new \InvalidArgumentException(sprintf('Method %s does not exist or is not callable through wrap().', $command));
+        }
 
         try {
-            // check that the method exists
-            if (! method_exists($this, $command)) {
-                throw new \InvalidArgumentException("Method {$command} does not exist.");
-            }
-
-            return call_user_func_array([$this, $command], $args);
-        } catch (\Exception $e) {
+            return $this->{$command}(...$args);
+        } catch (\Exception) {
             return null;
         }
     }
@@ -970,779 +1097,702 @@ final class RedisClient implements RedisInterface
      */
 
     /**
-     * Increment key value
-     *
-     * @param string $key key
-     * @param int $value value for increment
-     * @return int current value
-     *
-     * @throws RedisImpossibleValueException exception on impossible value
-     * @throws RedisConnectionException exception on connection to redis instance
-     * @throws BaseRedisException exception on redis exception
+     * @throws RedisImpossibleValueException if the key holds a non-integer value
+     * @throws BaseRedisException
      */
-    public function incr(string $key, int $value = 1) : int
+    public function incr(string $key, int $value = 1): int
     {
-        $value = (int) $value;
-
         try {
-            $result = ($value > 1)
-                ? $this->connection()->incrBy($key, $value)
-                : $this->connection()->incr($key);
-            if ($result !== false) {
-                return $result;
-            }
-
-            throw new RedisImpossibleValueException();
+            $result = ($value === 1)
+                ? $this->connection()->incr($key)
+                : $this->connection()->incrBy($key, $value);
         } catch (\RedisException $e) {
-            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
+            throw self::wrapException($e);
         }
+
+        if (! is_int($result)) {
+            throw new RedisImpossibleValueException(sprintf('Could not increment key "%s".', $key));
+        }
+
+        return $result;
     }
 
     /**
-     * Decrement key value
-     *
-     * @param string $key key
-     * @param int $value value for increment
-     * @return int current value
-     *
-     * @throws RedisImpossibleValueException exception on impossible value
-     * @throws RedisConnectionException exception on connection to redis instance
-     * @throws BaseRedisException exception on redis exception
+     * @throws RedisImpossibleValueException if the key holds a non-integer value
+     * @throws BaseRedisException
      */
-    public function decr(string $key, int $value = 1) : int
+    public function decr(string $key, int $value = 1): int
     {
-        $value = (int) $value;
-
         try {
-            $result = ($value > 1)
-                ? $this->connection()->decrBy($key, $value)
-                : $this->connection()->decr($key);
-            if ($result !== false) {
-                return $result;
-            }
-
-            throw new RedisImpossibleValueException();
+            $result = ($value === 1)
+                ? $this->connection()->decr($key)
+                : $this->connection()->decrBy($key, $value);
         } catch (\RedisException $e) {
-            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
+            throw self::wrapException($e);
         }
+
+        if (! is_int($result)) {
+            throw new RedisImpossibleValueException(sprintf('Could not decrement key "%s".', $key));
+        }
+
+        return $result;
     }
 
     /**
-     * Append string value
-     *
-     * @param string $key key
-     * @param mixed $value appended value
-     * @return int length of a key after append
-     *
-     * @throws RedisImpossibleValueException exception on impossible value
-     * @throws RedisConnectionException exception on connection to redis instance
-     * @throws BaseRedisException exception on redis exception
+     * @throws RedisImpossibleValueException
+     * @throws BaseRedisException
      */
-    public function append(string $key, $value) : int
+    public function append(string $key, string|int|float $value): int
     {
         try {
-            $result = $this->connection()->append($key, $value);
-            if ($result !== false) {
-                return $result;
-            }
-
-            throw new RedisImpossibleValueException();
+            $result = $this->connection()->append($key, (string) $value);
         } catch (\RedisException $e) {
-            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
+            throw self::wrapException($e);
         }
+
+        if (! is_int($result)) {
+            throw new RedisImpossibleValueException(sprintf('Could not append to key "%s".', $key));
+        }
+
+        return $result;
     }
 
     /**
-     * Get key value
-     *
-     * @param string $key key
-     *
-     * @return mixed value
-     *
-     * @throws RedisConnectionException exception on connection to redis instance
-     * @throws RedisKeyNotFoundException when key not found
-     * @throws BaseRedisException exception on redis exception
+     * @throws RedisKeyNotFoundException when the key does not exist
+     * @throws BaseRedisException
      */
-    public function get(string $key)
+    public function get(string $key): mixed
     {
         try {
             $result = $this->connection()->get($key);
-            if ($result === false) {
-                throw new RedisKeyNotFoundException();
-            }
-
-            return $this->decode($result);
         } catch (\RedisException $e) {
-            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
+            throw self::wrapException($e);
         }
+
+        if ($result === false) {
+            throw new RedisKeyNotFoundException(sprintf('Key "%s" not found.', $key));
+        }
+
+        return $this->decode($result);
     }
 
     /**
-     * Get multiple keys values
+     * Missing keys are returned with the $default value (false, unless specified).
+     * Stored false values are distinguishable from missing keys when a $default is given.
      *
-     * @param array $keys keys
-     * @return array values
+     * @param array<int, string> $keys
+     * @param mixed              $default value returned for missing keys
      *
-     * @throws RedisConnectionException exception on connection to redis instance
-     * @throws RedisImpossibleValueException when impossible value
-     * @throws BaseRedisException exception on redis exception
+     * @return array<string, mixed>
+     *
+     * @throws RedisImpossibleValueException
+     * @throws BaseRedisException
      */
-    public function mget(array $keys)
+    public function mget(array $keys, mixed $default = false): array
     {
+        if ($keys === []) {
+            return [];
+        }
+
+        $keys = array_map('strval', array_values($keys));
+
         try {
             $result = $this->connection()->mGet($keys);
-            if ($result !== false) {
-                $result = array_map([$this, 'decode'], $result);
+        } catch (\RedisException $e) {
+            throw self::wrapException($e);
+        }
 
-                return array_combine($keys, $result);
+        if (! is_array($result)) {
+            throw new RedisImpossibleValueException('MGET failed.');
+        }
+
+        return array_combine($keys, array_map(
+            fn (mixed $value): mixed => $value === false ? $default : $this->decode($value),
+            $result
+        ));
+    }
+
+    /**
+     * @param int|null $ttl TTL in seconds, overriding the configured cache TTL (no jitter is added).
+     *                      0 means "no expiration", null means "use the configured cache TTL".
+     *
+     * @throws RedisImpossibleValueException
+     * @throws BaseRedisException
+     */
+    public function set(string $key, mixed $value, ?int $ttl = null): bool
+    {
+        try {
+            $ttl = $this->ttlMs($ttl);
+            $result = ($ttl > 0)
+                ? $this->connection()->psetex($key, $ttl, $this->encode($value))
+                : $this->connection()->set($key, $this->encode($value));
+        } catch (\RedisException $e) {
+            throw self::wrapException($e);
+        }
+
+        if ($result === false) {
+            throw new RedisImpossibleValueException(sprintf('Could not set key "%s".', $key));
+        }
+
+        return true;
+    }
+
+    /**
+     * Sets multiple keys atomically (MULTI/EXEC when a TTL applies, MSET otherwise).
+     *
+     * @param array<string, mixed> $values
+     * @param int|null             $ttl    TTL in seconds, overriding the configured cache TTL (no jitter is added).
+     *                                     0 means "no expiration", null means "use the configured cache TTL".
+     *
+     * @throws BaseRedisException
+     */
+    public function mset(array $values, ?int $ttl = null): bool
+    {
+        if ($values === []) {
+            return true;
+        }
+
+        $this->ttlMs($ttl); // validates $ttl
+
+        try {
+            $redis = $this->connection();
+
+            if ($ttl === 0 || ($ttl === null && $this->cacheTtlSeconds === 0)) {
+                return (bool) $redis->mset(array_map([$this, 'encode'], $values));
             }
 
-            throw new RedisImpossibleValueException();
+            $redis->multi();
+            foreach ($values as $key => $value) {
+                $redis->psetex((string) $key, $this->ttlMs($ttl), $this->encode($value));
+            }
+            $results = $redis->exec();
+
+            return is_array($results) && ! in_array(false, $results, true);
         } catch (\RedisException $e) {
-            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
+            throw self::wrapException($e);
         }
     }
 
     /**
-     * Set key value
+     * @param int|null $ttl TTL in seconds, overriding the configured cache TTL (no jitter is added).
+     *                      0 means "no expiration", null means "use the configured cache TTL".
      *
-     * @param string $key key
-     * @param mixed $value value
-     * @return bool operation result
+     * @return bool true if the key was set, false if it already existed
      *
-     * @throws RedisConnectionException exception on connection to redis instance
-     * @throws RedisImpossibleValueException exception on impossible value
-     * @throws BaseRedisException exception on redis exception
+     * @throws BaseRedisException
      */
-    public function set(string $key, $value)
+    public function setnx(string $key, mixed $value, ?int $ttl = null): bool
     {
         try {
-            if ($this->cacheTTL > 0) {
-                $result = $this->connection()->psetex($key, $this->cacheTTL, $this->encode($value));
+            $ttl = $this->ttlMs($ttl);
+
+            return (bool) (($ttl > 0)
+                ? $this->connection()->set($key, $this->encode($value), ['nx', 'px' => $ttl])
+                : $this->connection()->setnx($key, $this->encode($value)));
+        } catch (\RedisException $e) {
+            throw self::wrapException($e);
+        }
+    }
+
+    /**
+     * Sets multiple keys only if none of them exists (all-or-nothing, like MSETNX), honoring the configured TTL.
+     *
+     * @param array<string, mixed> $values
+     *
+     * @return bool true if all keys were set, false if at least one key already existed
+     *
+     * @throws BaseRedisException
+     */
+    public function msetnx(array $values): bool
+    {
+        if ($values === []) {
+            return true;
+        }
+
+        try {
+            $redis = $this->connection();
+
+            if ($this->cacheTtlSeconds === 0) {
+                return (bool) $redis->msetnx(array_map([$this, 'encode'], $values));
+            }
+
+            // optimistic locking: abort if any of the keys is created/modified by someone else meanwhile
+            $keys = array_map('strval', array_keys($values));
+            $redis->watch($keys);
+            if (self::toInt($redis->exists($keys)) > 0) {
+                $redis->unwatch();
+
+                return false;
+            }
+
+            $redis->multi();
+            foreach ($values as $key => $value) {
+                $redis->psetex((string) $key, $this->effectiveTtlMs(), $this->encode($value));
+            }
+            $results = $redis->exec();
+
+            return is_array($results) && ! in_array(false, $results, true);
+        } catch (\RedisException $e) {
+            throw self::wrapException($e);
+        }
+    }
+
+    /**
+     * Atomically sets a new value and returns the previous one. The configured TTL is applied to the key.
+     *
+     * @return mixed the previous value, or false if the key did not exist
+     *
+     * @throws BaseRedisException
+     */
+    public function getset(string $key, mixed $value): mixed
+    {
+        try {
+            $redis = $this->connection();
+            $ttl = $this->effectiveTtlMs();
+
+            if ($ttl === 0) {
+                $previous = $redis->getSet($key, $this->encode($value));
             } else {
-                $result = $this->connection()->set($key, $this->encode($value));
+                $redis->multi();
+                $redis->getSet($key, $this->encode($value));
+                $redis->pexpire($key, $ttl);
+                $results = $redis->exec();
+                $previous = is_array($results) ? $results[0] : false;
             }
-
-            if ($result !== false) {
-                return $result;
-            }
-
-            throw new RedisImpossibleValueException();
         } catch (\RedisException $e) {
-            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
+            throw self::wrapException($e);
         }
+
+        return $previous === false ? false : $this->decode($previous);
     }
 
     /**
-     * Set multiple key values
+     * @param string|array<int, string> $keys
      *
-     * @param array $values key and values
-     * @return bool operation result
+     * @return int number of deleted keys
      *
-     * @throws RedisConnectionException exception on connection to redis instance
-     * @throws BaseRedisException exception on redis exception
+     * @throws RedisImpossibleValueException
+     * @throws BaseRedisException
      */
-    public function mset(array $values)
+    public function delete(string|array $keys): int
     {
-        try {
-            if ($this->cacheTTL > 0) {
-                $result = true;
-                foreach ($values as $key => $value) {
-                    $result = $result && $this->connection()->psetex($key, $this->cacheTTL, $this->encode($value));
-                }
-
-                return $result;
-            } else {
-                $values = array_map([$this, 'encode'], $values);
-
-                return $this->connection()->mset($values);
-            }
-        } catch (\RedisException $e) {
-            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
+        if ($keys === []) {
+            return 0;
         }
-    }
 
-    /**
-     * Set key value if not exists
-     *
-     * @param string $key key
-     * @param mixed $value value
-     * @return bool returns true, if operation complete succesfull, else false
-     *
-     * @throws RedisConnectionException exception on connection to redis instance
-     * @throws BaseRedisException exception on redis exception
-     */
-    public function setnx(string $key, $value)
-    {
-        try {
-            if ($this->cacheTTL > 0) {
-                $result = $this->connection()->set($key, $this->encode($value), ['nx', 'px' => $this->cacheTTL]);
-            } else {
-                $result = $this->connection()->setnx($key, $this->encode($value));
-            }
-
-            return $result;
-        } catch (\RedisException $e) {
-            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
-        }
-    }
-
-    /**
-     * Set multiple key values
-     *
-     * @param array $values key and values
-     * @return bool operation result
-     *
-     * @throws RedisConnectionException exception on connection to redis instance
-     * @throws BaseRedisException exception on redis exception
-     */
-    public function msetnx(array $values)
-    {
-        try {
-            if ($this->cacheTTL > 0) {
-                $result = true;
-                foreach ($values as $key => $value) {
-                    $result = $result && $this->connection()->set($key, $this->encode($value), ['nx', 'px' => $this->cacheTTL]);
-                }
-
-                return $result;
-            }
-
-            $values = array_map([$this, 'encode'], $values);
-
-            return $this->connection()->msetnx($values);
-        } catch (\RedisException $e) {
-            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
-        }
-    }
-
-    /**
-     * GetSet implementation
-     *
-     * @param string $key key
-     * @param mixed $value value
-     * @return bool|mixed previous value of a key. If key did not set, method returns false
-     *
-     * @throws RedisConnectionException exception on connection to redis instance
-     * @throws BaseRedisException exception on redis exception
-     */
-    public function getset(string $key, $value)
-    {
-        try {
-            return $this->connection()->getSet($key, $this->encode($value));
-        } catch (\RedisException $e) {
-            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
-        }
-    }
-
-    /**
-     * Delete key or keys
-     *
-     * @param string|array $keys key or keys array
-     * @return int count of deleted keys
-     *
-     * @throws RedisConnectionException exception on connection to redis instance
-     * @throws RedisImpossibleValueException exception on impossible value
-     * @throws BaseRedisException exception on redis exception
-     */
-    public function delete($keys)
-    {
         try {
             $result = $this->connection()->del($keys);
-            if ($result !== false) {
-                return $result;
-            }
-
-            throw new RedisImpossibleValueException();
         } catch (\RedisException $e) {
-            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
+            throw self::wrapException($e);
         }
+
+        if (! is_int($result)) {
+            throw new RedisImpossibleValueException('DEL failed.');
+        }
+
+        return $result;
     }
 
     /**
-     * Check if key exists
+     * Checks if a key exists, updating the hits/misses counters.
+     * Always returns false when force_revalidate is enabled.
      *
-     * @param string $key key
-     * @return bool check result
-     *
-     * @throws RedisConnectionException exception on connection to redis instance
-     * @throws BaseRedisException exception on redis exception
+     * @throws BaseRedisException
      */
-    public function exists(string $key) : bool
+    public function exists(string $key): bool
     {
         try {
-            $exists = (! $this->forceRevalidate) ? $this->connection()->exists($key) : false;
-            if ($exists) {
-                $this->hits++;
-            } else {
-                $this->misses++;
-            }
-
-            return $exists;
+            $exists = ! $this->forceRevalidate && self::toInt($this->connection()->exists($key)) > 0;
         } catch (\RedisException $e) {
-            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
+            throw self::wrapException($e);
         }
+
+        if ($exists) {
+            $this->hits++;
+        } else {
+            $this->misses++;
+        }
+
+        return $exists;
     }
 
     /**
-     * Rename key
+     * @return bool false if the source key does not exist
      *
-     * @param string $source current key name
-     * @param string $destination needed key name
-     * @return bool operation result. If false, source key not found
-     *
-     * @throws RedisConnectionException exception on connection to redis instance
-     * @throws BaseRedisException exception on redis exception
+     * @throws BaseRedisException
      */
-    public function rename(string $source, string $destination)
+    public function rename(string $source, string $destination): bool
     {
         try {
-            return $this->connection()->rename($source, $destination);
+            return (bool) $this->connection()->rename($source, $destination);
         } catch (\RedisException $e) {
-            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
+            throw self::wrapException($e);
         }
     }
 
     /**
-     * Rename key if needed key name was not
+     * @return bool false if the source key does not exist, or the destination key already exists
      *
-     * @param string $source current key name
-     * @param string $destination needed key name
-     * @return bool operation result. If false, source key not found or needed key name found
-     *
-     * @throws RedisConnectionException exception on connection to redis instance
-     * @throws BaseRedisException exception on redis exception
+     * @throws BaseRedisException
      */
-    public function renamenx(string $source, string $destination)
+    public function renamenx(string $source, string $destination): bool
     {
         try {
-            return $this->connection()->renamenx($source, $destination);
+            return (bool) $this->connection()->renameNx($source, $destination);
         } catch (\RedisException $e) {
-            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
+            throw self::wrapException($e);
         }
     }
 
     /**
-     * Get string length of a key
-     *
-     * @param string $key key
-     * @return int key value length
-     *
-     * @throws RedisConnectionException exception on connection to redis instance
-     * @throws RedisImpossibleValueException exception on impossible value
-     * @throws BaseRedisException exception on redis exception
+     * @throws RedisImpossibleValueException
+     * @throws BaseRedisException
      */
-    public function strlen(string $key)
+    public function strlen(string $key): int
     {
         try {
             $result = $this->connection()->strlen($key);
-            if ($result !== false) {
-                return $result;
-            }
-
-            throw new RedisImpossibleValueException();
         } catch (\RedisException $e) {
-            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
+            throw self::wrapException($e);
         }
+
+        if (! is_int($result)) {
+            throw new RedisImpossibleValueException(sprintf('Could not get the length of key "%s".', $key));
+        }
+
+        return $result;
     }
 
     /**
-     * Set ttl for a key
+     * @param int $timeout TTL in milliseconds
      *
-     * @param string $key key
-     * @param int $timeout ttl in milliseconds
-     * @return bool operation result. If false ttl cound not be set, or key not found
+     * @return bool false if the key does not exist
      *
-     * @throws RedisConnectionException exception on connection to redis instance
-     * @throws BaseRedisException exception on redis exception
+     * @throws BaseRedisException
      */
-    public function expire(string $key, int $timeout)
+    public function expire(string $key, int $timeout): bool
     {
         try {
-            return $this->connection()->pexpire($key, $timeout);
+            return (bool) $this->connection()->pexpire($key, $timeout);
         } catch (\RedisException $e) {
-            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
+            throw self::wrapException($e);
         }
     }
 
     /**
-     * Set time of life for the key
+     * @param int $timestamp unix timestamp (seconds) at which the key expires
      *
-     * @param string $key key
-     * @param int $timestamp unix timestamp of time of death
-     * @return bool operation result. If false timestamp cound not be set, or key not found
+     * @return bool false if the key does not exist
      *
-     * @throws RedisConnectionException exception on connection to redis instance
-     * @throws BaseRedisException exception on redis exception
+     * @throws BaseRedisException
      */
-    public function expireat(string $key, int $timestamp)
+    public function expireat(string $key, int $timestamp): bool
     {
         try {
-            return $this->connection()->expireat($key, $timestamp);
+            return (bool) $this->connection()->expireAt($key, $timestamp);
         } catch (\RedisException $e) {
-            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
+            throw self::wrapException($e);
         }
     }
 
     /**
-     * Get ttl of the key
+     * @return int|false TTL in milliseconds, or false if the key has no TTL or does not exist
      *
-     * @param string $key key
-     * @return int|bool ttl in milliseconds or false, if ttl is not set or key not found
-     *
-     * @throws RedisConnectionException exception on connection to redis instance
-     * @throws BaseRedisException exception on redis exception
+     * @throws BaseRedisException
      */
-    public function ttl(string $key)
+    public function ttl(string $key): int|false
     {
         try {
             $result = $this->connection()->pttl($key);
-
-            return ($result != -1) ? $result : false;
         } catch (\RedisException $e) {
-            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
+            throw self::wrapException($e);
         }
+
+        return (is_int($result) && $result >= 0) ? $result : false;
     }
 
     /**
-     * Remove ttl from the key
+     * @return bool false if the key has no TTL or does not exist
      *
-     * @param string $key key
-     * @return bool if true ttl was removed successful, if false ttl did not set, or key not found
-     *
-     * @throws RedisConnectionException exception on connection to redis instance
-     * @throws BaseRedisException exception on redis exception
+     * @throws BaseRedisException
      */
-    public function persist(string $key)
+    public function persist(string $key): bool
     {
         try {
-            return $this->connection()->persist($key);
+            return (bool) $this->connection()->persist($key);
         } catch (\RedisException $e) {
-            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
+            throw self::wrapException($e);
         }
     }
 
     /**
-     * Get key bit
-     *
-     * @param string $key key
-     * @param int $offset bit offset
-     * @return int bit value at the offset
-     *
-     * @throws RedisConnectionException exception on connection to redis instance
-     * @throws RedisImpossibleValueException exception on impossible value
-     * @throws BaseRedisException exception on redis exception
+     * @throws RedisImpossibleValueException
+     * @throws BaseRedisException
      */
-    public function getbit(string $key, int $offset) : int
+    public function getbit(string $key, int $offset): int
     {
-        $offset = (int) $offset;
-
         try {
             $result = $this->connection()->getBit($key, $offset);
-            if ($result !== false) {
-                return $result;
-            }
-
-            throw new RedisImpossibleValueException();
         } catch (\RedisException $e) {
-            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
+            throw self::wrapException($e);
         }
+
+        if (! is_int($result)) {
+            throw new RedisImpossibleValueException(sprintf('Could not get bit %d of key "%s".', $offset, $key));
+        }
+
+        return $result;
     }
 
     /**
-     * Set key bit
+     * @param int $value bit value; any non-zero value is treated as 1
      *
-     * @param string $key key
-     * @param int $offset bit offset
-     * @param int $value bit value. May be 0 or 1
-     * @return int bit value before operation complete
+     * @return int the previous bit value
      *
-     * @throws RedisConnectionException exception on connection to redis instance
-     * @throws RedisImpossibleValueException exception on impossible value
-     * @throws BaseRedisException exception on redis exception
+     * @throws RedisImpossibleValueException
+     * @throws BaseRedisException
      */
-    public function setbit(string $key, int $offset, int $value) : int
+    public function setbit(string $key, int $offset, int $value): int
     {
-        $offset = (int) $offset;
-        $value = (int) (bool) $value;
-
         try {
-            $result = $this->connection()->setBit($key, $offset, $value);
-            if ($result !== false) {
-                return $result;
-            }
-
-            throw new RedisImpossibleValueException();
+            $result = $this->connection()->setBit($key, $offset, $value !== 0);
         } catch (\RedisException $e) {
-            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
+            throw self::wrapException($e);
         }
+
+        if (! is_int($result)) {
+            throw new RedisImpossibleValueException(sprintf('Could not set bit %d of key "%s".', $offset, $key));
+        }
+
+        return $result;
     }
 
     /**
-     * Evaluate Lua code
+     * @param array<int, mixed> $arguments script arguments: the first $numKeys are KEYS, the rest are ARGV
+     * @param int|null          $numKeys   number of arguments to pass as KEYS. Defaults to all of them.
      *
-     * @param string $code string of Lua code
-     * @param array $arguments array of Lua script arguments
-     * @return mixed code execution result
-     *
-     * @throws RedisConnectionException exception on connection to redis instance
-     * @throws RedisScriptExecutionException when script execution faled
-     * @throws BaseRedisException exception on redis exception
+     * @throws RedisScriptExecutionException when the script fails
+     * @throws BaseRedisException
      */
-    public function evaluate(string $code, array $arguments = [])
+    public function evaluate(string $code, array $arguments = [], ?int $numKeys = null): mixed
     {
+        return $this->runScript('eval', $code, $arguments, $numKeys);
+    }
+
+    /**
+     * @param array<int, mixed> $arguments script arguments: the first $numKeys are KEYS, the rest are ARGV
+     * @param int|null          $numKeys   number of arguments to pass as KEYS. Defaults to all of them.
+     *
+     * @throws RedisScriptExecutionException when the script fails
+     * @throws BaseRedisException
+     */
+    public function evalSha(string $sha, array $arguments = [], ?int $numKeys = null): mixed
+    {
+        return $this->runScript('evalSha', $sha, $arguments, $numKeys);
+    }
+
+    /**
+     * @param 'eval'|'evalSha'   $method
+     * @param array<int, mixed>  $arguments
+     */
+    private function runScript(string $method, string $script, array $arguments, ?int $numKeys): mixed
+    {
+        $arguments = array_values($arguments);
+        $numKeys ??= count($arguments);
+
+        if ($numKeys < 0 || $numKeys > count($arguments)) {
+            throw new \InvalidArgumentException('$numKeys must be between 0 and the number of arguments.');
+        }
+
         try {
-            if (empty($arguments)) {
-                $result = $this->connection()->eval($code);
-            } else {
-                $result = $this->connection()->eval($code, $arguments, count($arguments));
-            }
+            $redis = $this->connection();
+            $redis->clearLastError();
+            $result = $redis->{$method}($script, $arguments, $numKeys);
+            $lastError = $redis->getLastError();
+            $redis->clearLastError();
+        } catch (\RedisException $e) {
+            throw self::wrapException($e);
+        }
 
-            $lastError = $this->connection()->getLastError();
-            $this->connection()->clearLastError();
-            if (is_null($lastError)) {
-                return $result;
-            }
-
+        if ($lastError !== null) {
             throw new RedisScriptExecutionException($lastError);
-        } catch (\RedisException $e) {
-            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
         }
+
+        return $result;
     }
 
     /**
-     * Evaluate Lua code by hash
+     * @return int number of members added to the set
      *
-     * @param string $sha SHA1 string of Lua code
-     * @param array $arguments array of Lua script arguments
-     * @return mixed code execution result
-     *
-     * @throws RedisConnectionException exception on connection to redis instance
-     * @throws RedisScriptExecutionException when script execution faled
-     * @throws BaseRedisException exception on redis exception
+     * @throws RedisImpossibleValueException
+     * @throws BaseRedisException
      */
-    public function evalSha(string $sha, array $arguments = [])
-    {
-        try {
-            if (empty($arguments)) {
-                $result = $this->connection()->evalSha($sha);
-            } else {
-                $result = $this->connection()->evalSha($sha, $arguments, count($arguments));
-            }
-
-            $lastError = $this->connection()->getLastError();
-            $this->connection()->clearLastError();
-            if (is_null($lastError)) {
-                return $result;
-            }
-
-            throw new RedisScriptExecutionException($lastError);
-        } catch (\RedisException $e) {
-            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
-        }
-    }
-
-    /**
-     * Add member to the set
-     *
-     * @param string $key key
-     * @param mixed $member set member
-     * @return int count of added members
-     *
-     * @throws RedisConnectionException exception on connection to redis instance
-     * @throws RedisImpossibleValueException exception on impossible value
-     * @throws BaseRedisException exception on redis exception
-     */
-    public function sadd(string $key, $member)
+    public function sadd(string $key, mixed $member): int
     {
         try {
             $result = $this->connection()->sAdd($key, $member);
-            if ($result !== false) {
-                return $result;
-            }
-
-            throw new RedisImpossibleValueException();
         } catch (\RedisException $e) {
-            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
+            throw self::wrapException($e);
         }
+
+        if (! is_int($result)) {
+            throw new RedisImpossibleValueException(sprintf('Could not add a member to set "%s".', $key));
+        }
+
+        return $result;
     }
 
     /**
-     * Pop (remove and return) a random member from the set
+     * @return mixed the popped member, or false if the set is empty
      *
-     * @param string $key key
-     * @return mixed set member
-     *
-     * @throws RedisConnectionException exception on connection to redis instance
-     * @throws BaseRedisException exception on redis exception
+     * @throws BaseRedisException
      */
-    public function spop(string $key)
+    public function spop(string $key): mixed
     {
         try {
             return $this->connection()->sPop($key);
         } catch (\RedisException $e) {
-            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
+            throw self::wrapException($e);
         }
     }
 
     /**
-     * Return random member from the set
+     * @return mixed a random member, or false if the set is empty
      *
-     * @param string $key key
-     * @return mixed set member
-     *
-     * @throws RedisConnectionException exception on connection to redis instance
-     * @throws BaseRedisException exception on redis exception
+     * @throws BaseRedisException
      */
-    public function srandmember(string $key)
+    public function srandmember(string $key): mixed
     {
         try {
             return $this->connection()->sRandMember($key);
         } catch (\RedisException $e) {
-            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
+            throw self::wrapException($e);
         }
     }
 
     /**
-     * Returns size of the set
-     *
-     * @param string $key set
-     * @return int members count of the set
-     *
-     * @throws RedisConnectionException exception on connection to redis instance
-     * @throws BaseRedisException exception on redis exception
+     * @throws BaseRedisException
      */
-    public function scard(string $key)
+    public function scard(string $key): int
     {
         try {
-            return $this->connection()->sCard($key);
+            return self::toInt($this->connection()->sCard($key));
         } catch (\RedisException $e) {
-            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
+            throw self::wrapException($e);
         }
     }
 
     /**
-     * Check that member is a member of the set
-     *
-     * @param string $key key
-     * @param mixed $member member
-     * @return bool check result
-     *
-     * @throws RedisConnectionException exception on connection to redis instance
-     * @throws BaseRedisException exception on redis exception
+     * @throws BaseRedisException
      */
-    public function sismembers(string $key, $member)
+    public function sismember(string $key, mixed $member): bool
     {
         try {
-            return $this->connection()->sIsMember($key, $member);
+            return (bool) $this->connection()->sIsMember($key, $member);
         } catch (\RedisException $e) {
-            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
+            throw self::wrapException($e);
         }
     }
 
     /**
-     * Returns all members of the set
+     * @deprecated since 2.0, use {@see RedisClient::sismember()} instead
      *
-     * @param string $key key
-     * @return array all members of the set
-     *
-     * @throws RedisConnectionException exception on connection to redis instance
-     * @throws BaseRedisException exception on redis exception
+     * @throws BaseRedisException
      */
-    public function smembers(string $key)
+    public function sismembers(string $key, mixed $member): bool
+    {
+        return $this->sismember($key, $member);
+    }
+
+    /**
+     * @return array<int, mixed>
+     *
+     * @throws BaseRedisException
+     */
+    public function smembers(string $key): array
     {
         try {
-            return $this->connection()->sMembers($key);
+            $result = $this->connection()->sMembers($key);
         } catch (\RedisException $e) {
-            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
+            throw self::wrapException($e);
+        }
+
+        return is_array($result) ? $result : [];
+    }
+
+    /**
+     * @return int number of members removed from the set
+     *
+     * @throws BaseRedisException
+     */
+    public function srem(string $key, mixed $member): int
+    {
+        try {
+            return self::toInt($this->connection()->sRem($key, $member));
+        } catch (\RedisException $e) {
+            throw self::wrapException($e);
         }
     }
 
     /**
-     * Remove member from the set
+     * @param array<int, string> $sources
      *
-     * @param string $key key
-     * @param mixed $member set member
-     * @return int count of removed elements
+     * @return int size of the resulting set
      *
-     * @throws RedisConnectionException exception on connection to redis instance
-     * @throws BaseRedisException exception on redis exception
+     * @throws RedisImpossibleValueException
+     * @throws BaseRedisException
      */
-    public function srem(string $key, $member)
+    public function sdiffstore(string $destination, array $sources): int
     {
-        try {
-            return $this->connection()->sRem($key);
-        } catch (\RedisException $e) {
-            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
-        }
+        return $this->setStore('sDiffStore', $destination, $sources);
     }
 
     /**
-     * Create difference set
+     * @param array<int, string> $sources
      *
-     * @param string $destination key for result set
-     * @param array $sources source keys
-     * @return int size of result set
+     * @return int size of the resulting set
      *
-     * @throws RedisConnectionException exception on connection to redis instance
-     * @throws RedisImpossibleValueException exception on impossible value
-     * @throws BaseRedisException exception on redis exception
+     * @throws RedisImpossibleValueException
+     * @throws BaseRedisException
      */
-    public function sdiffstore(string $destination, array $sources)
+    public function sinterstore(string $destination, array $sources): int
     {
-        try {
-            return call_user_func_array([
-                $this->connection(),
-                'sDiffStore',
-            ], array_merge([$destination], $sources));
-        } catch (\RedisException $e) {
-            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
-        }
+        return $this->setStore('sInterStore', $destination, $sources);
     }
 
     /**
-     * Create intersection set
+     * @param array<int, string> $sources
      *
-     * @param string $destination key for result set
-     * @param array $sources source keys
-     * @return int size of result set
+     * @return int size of the resulting set
      *
-     * @throws RedisConnectionException exception on connection to redis instance
-     * @throws RedisImpossibleValueException exception on impossible value
-     * @throws BaseRedisException exception on redis exception
+     * @throws RedisImpossibleValueException
+     * @throws BaseRedisException
      */
-    public function sinterstore(string $destination, array $sources)
+    public function sunionstore(string $destination, array $sources): int
     {
-        try {
-            return call_user_func_array([
-                $this->connection(),
-                'sInterStore',
-            ], array_merge([$destination], $sources));
-        } catch (\RedisException $e) {
-            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
-        }
+        return $this->setStore('sUnionStore', $destination, $sources);
     }
 
     /**
-     * Create union set
-     *
-     * @param string $destination key for result set
-     * @param array $sources source keys
-     * @return int size of result set
-     *
-     * @throws RedisConnectionException exception on connection to redis instance
-     * @throws RedisImpossibleValueException exception on impossible value
-     * @throws BaseRedisException exception on redis exception
+     * @param 'sDiffStore'|'sInterStore'|'sUnionStore' $method
+     * @param array<int, string>                         $sources
      */
-    public function sunionstore(string $destination, array $sources)
+    private function setStore(string $method, string $destination, array $sources): int
     {
-        try {
-            return call_user_func_array([
-                $this->connection(),
-                'sUnionStore',
-            ], array_merge([$destination], $sources));
-        } catch (\RedisException $e) {
-            throw new BaseRedisException($e->getMessage(), $e->getCode(), $e);
+        if ($sources === []) {
+            throw new \InvalidArgumentException('At least one source key is required.');
         }
+
+        try {
+            $result = $this->connection()->{$method}($destination, ...array_map('strval', array_values($sources)));
+        } catch (\RedisException $e) {
+            throw self::wrapException($e);
+        }
+
+        if (! is_int($result)) {
+            throw new RedisImpossibleValueException(sprintf('%s failed.', strtoupper($method)));
+        }
+
+        return $result;
     }
 }

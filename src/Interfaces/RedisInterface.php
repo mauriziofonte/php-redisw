@@ -1,281 +1,345 @@
 <?php
 
+declare(strict_types=1);
+
 namespace Mfonte\Redisw\Interfaces;
 
+use Mfonte\Redisw\Exception\RedisConnectionException;
+use Mfonte\Redisw\Exception\RedisException;
+use Mfonte\Redisw\Exception\RedisImpossibleValueException;
+use Mfonte\Redisw\Exception\RedisKeyNotFoundException;
+use Mfonte\Redisw\Exception\RedisScriptExecutionException;
+
 /**
- * Redis commands interface
+ * Redis commands interface.
+ *
+ * Every method may throw a {@see RedisConnectionException} if the connection can't be established,
+ * and a {@see RedisException} if phpredis reports an error.
+ *
  * @author Maurizio Fonte <fonte.maurizio@gmail.com>
- * @date 2023-03-21
  */
 interface RedisInterface
 {
     /**
-     * Increment key value
-     * @param string $key key
-     * @param int $value value for increment
-     * @return int current value
-     * @throws RedisConnectException exception on connection to redis instance
+     * Increment the integer value of a key.
+     *
+     * @return int the value after the increment
+     *
+     * @throws RedisImpossibleValueException if the key holds a non-integer value
+     * @throws RedisException
      */
-    public function incr(string $key, int $value = 1);
+    public function incr(string $key, int $value = 1): int;
 
     /**
-     * Decrement key value
-     * @param string $key key
-     * @param int $value value for increment
-     * @return int current value
-     * @throws RedisConnectException exception on connection to redis instance
+     * Decrement the integer value of a key.
+     *
+     * @return int the value after the decrement
+     *
+     * @throws RedisImpossibleValueException if the key holds a non-integer value
+     * @throws RedisException
      */
-    public function decr(string $key, int $value = 1);
+    public function decr(string $key, int $value = 1): int;
 
     /**
-     * Append string value
-     * @param string $key key
-     * @param mixed $value appended value
-     * @return int length of a key after append
-     * @throws RedisConnectException
+     * Append a string to the value of a key. The value is appended raw (it is not serialized).
+     *
+     * @return int the length of the string after the append
+     *
+     * @throws RedisImpossibleValueException
+     * @throws RedisException
      */
-    public function append(string $key, $value);
+    public function append(string $key, string|int|float $value): int;
 
     /**
-     * Get key value
-     * @param string $key key
-     * @return mixed key value
-     * @throws RedisConnectException exception on connection to redis instance
-     * @throws RedisKeyNotFoundException when key not found
+     * Get the value of a key.
+     *
+     * @throws RedisKeyNotFoundException when the key does not exist
+     * @throws RedisException
      */
-    public function get(string $key);
+    public function get(string $key): mixed;
 
     /**
-     * Get multiple keys values
-     * @param array $keys keys
-     * @return array values
-     * @throws RedisConnectException exception on connection to redis instance
+     * Get the values of multiple keys. Missing keys are returned with the $default value.
+     *
+     * @param array<int, string> $keys
+     * @param mixed              $default value returned for missing keys
+     *
+     * @return array<string, mixed> values, indexed by key
+     *
+     * @throws RedisException
      */
-    public function mget(array $keys);
+    public function mget(array $keys, mixed $default = false): array;
 
     /**
-     * Set key value
-     * @param string $key key
-     * @param mixed $value value
-     * @return bool operation result
-     * @throws RedisConnectException exception on connection to redis instance
+     * Set the value of a key.
+     *
+     * @param int|null $ttl TTL in seconds. null applies the configured cache TTL, 0 means "no expiration".
+     *
+     * @throws RedisImpossibleValueException
+     * @throws RedisException
      */
-    public function set(string $key, $value);
+    public function set(string $key, mixed $value, ?int $ttl = null): bool;
 
     /**
-     * Set multiple key values
-     * @param array $values key and values
-     * @return bool operation result
-     * @throws RedisConnectException exception on connection to redis instance
+     * Set multiple keys atomically.
+     *
+     * @param array<string, mixed> $values values, indexed by key
+     * @param int|null             $ttl    TTL in seconds. null applies the configured cache TTL, 0 means "no expiration".
+     *
+     * @throws RedisException
      */
-    public function mset(array $values);
+    public function mset(array $values, ?int $ttl = null): bool;
 
     /**
-     * Set key value if not exists
-     * @param string $key key
-     * @param mixed $value value
-     * @return bool returns true, if operation complete succesfull, else false
-     * @throws RedisConnectException exception on connection to redis instance
+     * Set the value of a key, only if it does not exist.
+     *
+     * @param int|null $ttl TTL in seconds. null applies the configured cache TTL, 0 means "no expiration".
+     *
+     * @return bool true if the key was set, false if it already existed
+     *
+     * @throws RedisException
      */
-    public function setnx(string $key, $value);
+    public function setnx(string $key, mixed $value, ?int $ttl = null): bool;
 
     /**
-     * Set multiple key values
-     * @param array $values key and values
-     * @return bool operation result
-     * @throws RedisConnectException exception on connection to redis instance
+     * Set multiple keys, only if none of them exists (all-or-nothing).
+     *
+     * @param array<string, mixed> $values values, indexed by key
+     *
+     * @return bool true if all keys were set, false if at least one key already existed
+     *
+     * @throws RedisException
      */
-    public function msetnx(array $values);
+    public function msetnx(array $values): bool;
 
     /**
-     * GetSet implementation
-     * @param string $key key
-     * @param mixed $value value
-     * @return bool|mixed previous value of a key. If key did not set, method returns false
-     * @throws RedisConnectException exception on connection to redis instance
+     * Atomically set the value of a key and return its previous value.
+     *
+     * @return mixed the previous value, or false if the key did not exist
+     *
+     * @throws RedisException
      */
-    public function getset(string $key, $value);
+    public function getset(string $key, mixed $value): mixed;
 
     /**
-     * Delete key or keys
-     * @param string|array $keys key or keys array
-     * @return int count of deleted keys
-     * @throws RedisConnectException exception on connection to redis instance
+     * Delete one or more keys.
+     *
+     * @param string|array<int, string> $keys
+     *
+     * @return int the number of deleted keys
+     *
+     * @throws RedisException
      */
-    public function delete($keys);
+    public function delete(string|array $keys): int;
 
     /**
-     * Check if key exists
-     * @param string $key key
-     * @return bool check result
-     * @throws RedisConnectException exception on connection to redis instance
+     * Check if a key exists.
+     *
+     * @throws RedisException
      */
-    public function exists(string $key);
+    public function exists(string $key): bool;
 
     /**
-     * Rename key
-     * @param string $source current key name
-     * @param string $destination needed key name
-     * @return bool operation result. If false, source key not found
-     * @throws RedisConnectException exception on connection to redis instance
+     * Rename a key.
+     *
+     * @return bool false if the source key does not exist
+     *
+     * @throws RedisException
      */
-    public function rename(string $source, string $destination);
+    public function rename(string $source, string $destination): bool;
 
     /**
-     * Rename key if needed key name was not
-     * @param string $source current key name
-     * @param string $destination needed key name
-     * @return bool operation result. If false, source key not found or needed key name found
-     * @throws RedisConnectException exception on connection to redis instance
+     * Rename a key, only if the destination key does not exist.
+     *
+     * @return bool false if the source key does not exist, or the destination key already exists
+     *
+     * @throws RedisException
      */
-    public function renamenx(string $source, string $destination);
+    public function renamenx(string $source, string $destination): bool;
 
     /**
-     * Get string length of a key
-     * @param string $key key
-     * @return int key value length
-     * @throws RedisConnectException exception on connection to redis instance
+     * Get the length of the string stored at a key.
+     *
+     * @throws RedisImpossibleValueException
+     * @throws RedisException
      */
-    public function strlen(string $key);
+    public function strlen(string $key): int;
 
     /**
-     * Set ttl for a key
-     * @param string $key key
-     * @param int $timeout ttl in milliseconds
-     * @return bool operation result. If false ttl cound not be set, or key not found
-     * @throws RedisConnectException exception on connection to redis instance
+     * Set a TTL on a key.
+     *
+     * @param int $timeout TTL in milliseconds
+     *
+     * @return bool false if the key does not exist
+     *
+     * @throws RedisException
      */
-    public function expire(string $key, int $timeout);
+    public function expire(string $key, int $timeout): bool;
 
     /**
-     * Set time of life for the key
-     * @param string $key key
-     * @param int $timestamp unix timestamp of time of death
-     * @return bool operation result. If false timestamp cound not be set, or key not found
-     * @throws RedisConnectException exception on connection to redis instance
+     * Set the expiration of a key as a unix timestamp.
+     *
+     * @param int $timestamp unix timestamp, in seconds
+     *
+     * @return bool false if the key does not exist
+     *
+     * @throws RedisException
      */
-    public function expireat(string $key, int $timestamp);
+    public function expireat(string $key, int $timestamp): bool;
 
     /**
-     * Get ttl of the key
-     * @param string $key key
-     * @return int|bool ttl in milliseconds or false, if ttl is not set or key not found
-     * @throws RedisConnectException exception on connection to redis instance
+     * Get the remaining TTL of a key.
+     *
+     * @return int|false TTL in milliseconds, or false if the key has no TTL or does not exist
+     *
+     * @throws RedisException
      */
-    public function ttl(string $key);
+    public function ttl(string $key): int|false;
 
     /**
-     * Remove ttl from the key
-     * @param string $key key
-     * @return bool if true ttl was removed successful, if false ttl did not set, or key not found
-     * @throws RedisConnectException exception on connection to redis instance
+     * Remove the TTL of a key.
+     *
+     * @return bool false if the key has no TTL or does not exist
+     *
+     * @throws RedisException
      */
-    public function persist(string $key);
+    public function persist(string $key): bool;
 
     /**
-     * Get key bit
-     * @param string $key key
-     * @param int $offset bit offset
-     * @return int bit value at the offset
-     * @throws RedisConnectException exception on connection to redis instance
+     * Get the bit value at an offset.
+     *
+     * @throws RedisImpossibleValueException
+     * @throws RedisException
      */
-    public function getbit(string $key, int $offset);
+    public function getbit(string $key, int $offset): int;
 
     /**
-     * Set key bit
-     * @param string $key key
-     * @param int $offset bit offset
-     * @param int $value bit value. May be 0 or 1
-     * @return int bit value before operation complete
-     * @throws RedisConnectException exception on connection to redis instance
+     * Set the bit value at an offset.
+     *
+     * @param int $value bit value; any non-zero value is treated as 1
+     *
+     * @return int the previous bit value
+     *
+     * @throws RedisImpossibleValueException
+     * @throws RedisException
      */
-    public function setbit(string $key, int $offset, int $value);
+    public function setbit(string $key, int $offset, int $value): int;
 
     /**
-     * Evaluate Lua code
-     * @param string $code string of Lua code
-     * @param array $arguments array of Lua script arguments
-     * @return mixed code execution result
-     * @throws RedisConnectException exception on connection to redis instance
-     * @throws RedisScriptExecutionException when script execution faled
+     * Evaluate a Lua script.
+     *
+     * @param array<int, mixed> $arguments script arguments: the first $numKeys are KEYS, the rest are ARGV
+     * @param int|null          $numKeys   number of arguments to pass as KEYS. Defaults to all of them.
+     *
+     * @throws RedisScriptExecutionException when the script fails
+     * @throws RedisException
      */
-    public function evaluate(string $code, array $arguments = []);
+    public function evaluate(string $code, array $arguments = [], ?int $numKeys = null): mixed;
 
     /**
-     * Evaluate Lua code by hash
-     * @param string $sha SHA1 string of Lua code
-     * @param array $arguments array of Lua script arguments
-     * @return mixed code execution result
-     * @throws RedisConnectException exception on connection to redis instance
-     * @throws RedisScriptExecutionException when script execution faled
+     * Evaluate a cached Lua script by its SHA1 digest.
+     *
+     * @param array<int, mixed> $arguments script arguments: the first $numKeys are KEYS, the rest are ARGV
+     * @param int|null          $numKeys   number of arguments to pass as KEYS. Defaults to all of them.
+     *
+     * @throws RedisScriptExecutionException when the script fails
+     * @throws RedisException
      */
-    public function evalSha(string $sha, array $arguments = []);
+    public function evalSha(string $sha, array $arguments = [], ?int $numKeys = null): mixed;
 
     /**
-     * Add member to the set
-     * @param string $key key
-     * @param mixed $member set member
-     * @return int count of added members
-     * @throws RedisConnectException exception on connection to redis instance
+     * Add a member to a set.
+     *
+     * @return int the number of members added
+     *
+     * @throws RedisImpossibleValueException
+     * @throws RedisException
      */
-    public function sadd(string $key, $member);
+    public function sadd(string $key, mixed $member): int;
 
     /**
-     * Pop (remove and return) a random member from the set
-     * @param string $key key
-     * @return mixed set member
-     * @throws RedisConnectException exception on connection to redis instance
+     * Remove and return a random member of a set.
+     *
+     * @return mixed the member, or false if the set is empty
+     *
+     * @throws RedisException
      */
-    public function spop(string $key);
+    public function spop(string $key): mixed;
 
     /**
-     * Return random member from the set
-     * @param string $key key
-     * @return mixed set member
-     * @throws RedisConnectException exception on connection to redis instance
+     * Return a random member of a set.
+     *
+     * @return mixed the member, or false if the set is empty
+     *
+     * @throws RedisException
      */
-    public function srandmember(string $key);
+    public function srandmember(string $key): mixed;
 
     /**
-     * Returns size of the set
-     * @param string $key set
-     * @return int members count of the set
-     * @throws RedisConnectException exception on connection to redis instance
+     * Get the number of members of a set.
+     *
+     * @throws RedisException
      */
-    public function scard(string $key);
+    public function scard(string $key): int;
 
     /**
-     * Check that member is a member of the set
-     * @param string $key key
-     * @param mixed $member member
-     * @return bool check result
-     * @throws RedisConnectException exception on connection to redis instance
+     * Check if a value is a member of a set.
+     *
+     * @throws RedisException
      */
-    public function sismembers(string $key, $member);
+    public function sismember(string $key, mixed $member): bool;
 
     /**
-     * Returns all members of the set
-     * @param string $key key
-     * @return array all members of the set
-     * @throws RedisConnectException exception on connection to redis instance
+     * Get all the members of a set.
+     *
+     * @return array<int, mixed>
+     *
+     * @throws RedisException
      */
-    public function smembers(string $key);
+    public function smembers(string $key): array;
 
     /**
-     * Remove member from the set
-     * @param string $key key
-     * @param mixed $member set member
-     * @return int count of removed elements
-     * @throws RedisConnectException exception on connection to redis instance
+     * Remove a member from a set.
+     *
+     * @return int the number of members removed
+     *
+     * @throws RedisException
      */
-    public function srem(string $key, $member);
+    public function srem(string $key, mixed $member): int;
 
     /**
-     * Create difference set
-     * @param string $destination key for result set
-     * @param array $sources source keys
-     * @return int size of result set
-     * @throws RedisConnectException exception on connection to redis instance
+     * Store the difference between the first set and all the following ones.
+     *
+     * @param array<int, string> $sources
+     *
+     * @return int the size of the resulting set
+     *
+     * @throws RedisImpossibleValueException
+     * @throws RedisException
      */
-    public function sdiffstore(string $destination, array $sources);
+    public function sdiffstore(string $destination, array $sources): int;
+
+    /**
+     * Store the intersection of the given sets.
+     *
+     * @param array<int, string> $sources
+     *
+     * @return int the size of the resulting set
+     *
+     * @throws RedisImpossibleValueException
+     * @throws RedisException
+     */
+    public function sinterstore(string $destination, array $sources): int;
+
+    /**
+     * Store the union of the given sets.
+     *
+     * @param array<int, string> $sources
+     *
+     * @return int the size of the resulting set
+     *
+     * @throws RedisImpossibleValueException
+     * @throws RedisException
+     */
+    public function sunionstore(string $destination, array $sources): int;
 }
