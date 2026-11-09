@@ -42,7 +42,7 @@ jobs:
       - name: Show phpredis capabilities
         run: php --ri redis
 
-      - uses: ramsey/composer-install@v3
+      - uses: ramsey/composer-install@v4
 
       - name: Run test suite
         run: vendor/bin/phpunit
@@ -62,7 +62,7 @@ jobs:
           extensions: redis
           coverage: none
 
-      - uses: ramsey/composer-install@v3
+      - uses: ramsey/composer-install@v4
 
       - name: Validate composer.json
         run: composer validate --strict
